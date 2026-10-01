@@ -31,28 +31,26 @@ struct SSweepProbe
 };
 
 //+------------------------------------------------------------------+
-//| Evaluated on every closed M1 bar. Two entry modes share one      |
-//| pipeline and one set of context filters:                         |
+//| Evaluated on every closed M1 bar. Three entry modes share one    |
+//| pipeline and one set of context filters. Direction comes from    |
+//| the FAST M5 micro-trend (EMA9 vs EMA21 + price side), NOT from   |
+//| the slow M15 regime - that lags by hours and, during a sharp     |
+//| move, points the wrong way. The regime only vetoes CHAOS.        |
 //|                                                                  |
-//|  MODE 1  TREND PULLBACK   (regime TREND_UP / TREND_DN)           |
-//|    M15 regime = direction only                                   |
-//|    M5  location : pullback into the M5 EMA9 zone, EMA21 support  |
-//|                   held, price not over-extended                  |
-//|    M1  trigger : momentum candle AND (micro-structure break OR   |
-//|                  reclaim of the M5 EMA9)                         |
+//|  MODE 1  PULLBACK    price retraces into the M5 EMA9 zone,       |
+//|                      support held, not extended; M1 momentum     |
+//|                      candle + (structure break OR EMA9 reclaim). |
+//|  MODE 2  SWEEP       a key level (PDH/PDL, Asian H/L, day H/L,   |
+//|                      round number) is taken by a wick, the M1    |
+//|                      closes back inside with rejection and       |
+//|                      displacement. Both directions, any regime.  |
+//|  MODE 3  MOMENTUM    impulse continuation: a big-body M1 candle  |
+//|                      closing near its extreme, breaking the      |
+//|                      micro swing in the micro-trend direction.   |
 //|                                                                  |
-//|  MODE 2  LIQUIDITY SWEEP  (TREND with-trend only, or RANGE both) |
-//|    A key level (PDH/PDL, Asian H/L, day H/L, round number) is    |
-//|    taken out by a wick, then the M1 bar closes back inside with  |
-//|    rejection (closes in the favourable part of its range) and    |
-//|    displacement (range >> average). Stops hide just beyond the   |
-//|    sweep extreme - the classic stop-hunt reversal.               |
-//|                                                                  |
-//|  CONTEXT FILTERS (both modes)                                    |
-//|    H1 bias not opposed | room to the next level >= N ATR |       |
-//|    RSI(M1) not exhausted | ATR(M5) above a dead-market floor     |
-//|                                                                  |
-//|  GRADE (A/B/C) counts confluence and scales position size; it    |
+//|  CONTEXT FILTERS (all modes): H1 bias not opposed | room to the  |
+//|  next level | RSI(M1) not exhausted | ATR floor.                 |
+//|  GRADE A/B/C counts confluence and scales position size; it      |
 //|  never replaces the entry rules. The trend score is NOT used.    |
 //+------------------------------------------------------------------+
 class CScalpEngine
@@ -69,6 +67,13 @@ private:
    int CountPass(const SSweepProbe &p)
    {
       return (p.swept ? 1 : 0) + (p.in_range ? 1 : 0) + (p.reclaim ? 1 : 0) + (p.reject ? 1 : 0) + (p.disp ? 1 : 0);
+   }
+
+   bool Fail(SScalpState &out, SSignalResult &signal, const string code)
+   {
+      signal.fail_code    = code;
+      signal.fail_details = out.reason;
+      return false;
    }
 
 public:
@@ -129,23 +134,17 @@ public:
          return Fail(out, signal, "S0");
       }
 
-      // ---- 1. Regime applicability --------------------------------------
-      int trend_dir = 0;
-      if(regime.active_regime == REGIME_TREND_UP)      trend_dir = 1;
-      else if(regime.active_regime == REGIME_TREND_DN) trend_dir = -1;
-      bool is_range = (regime.active_regime == REGIME_RANGE);
-
-      if(trend_dir == 0 && !(is_range && m_cfg.sweep_enabled))
+      // ---- 1. Regime: only CHAOS (and warm-up) veto the scalp layer ------------
+      ENUM_REGIME ar = regime.active_regime;
+      if(ar != REGIME_TREND_UP && ar != REGIME_TREND_DN && ar != REGIME_RANGE && ar != REGIME_EXPANSION)
       {
-         out.reason = StringFormat("Regime is %s - scalps need TREND_UP / TREND_DN%s",
-                                   RegimeToString(regime.active_regime),
-                                   m_cfg.sweep_enabled ? " or RANGE (sweeps)" : "");
+         out.reason = StringFormat("Regime is %s - scalping paused", RegimeToString(ar));
          return Fail(out, signal, "S1");
       }
-      out.regime_ok = true;
-      out.direction = (trend_dir > 0) ? DIR_LONG : ((trend_dir < 0) ? DIR_SHORT : DIR_NONE);
+      out.regime_ok  = true;
+      out.regime_dir = (ar == REGIME_TREND_UP) ? 1 : ((ar == REGIME_TREND_DN) ? -1 : 0);
 
-      // ---- 2. Inputs ------------------------------------------------------
+      // ---- 2. Inputs ------------------------------------------------------------
       double atr = regime.atr_m5;
       if(atr <= 0.0)
       {
@@ -174,14 +173,23 @@ public:
       double avg_range = 0.0;
       for(int r = 1; r <= 10; r++) avg_range += (m1[r].high - m1[r].low);
       avg_range /= 10.0;
+      double rng0 = m1[0].high - m1[0].low;
 
-      // ---- 3. MODE 1: trend pullback (only inside a trend regime) ------------
+      // ---- 3. Fast M5 micro-trend (direction for modes 1 and 3) ---------------------
+      int m5dir = 0;
+      if(ema9 > ema21 && close0 > ema21)      m5dir = 1;
+      else if(ema9 < ema21 && close0 < ema21) m5dir = -1;
+      out.m5_dir = m5dir;
+
+      // ---- 4. MODES 1 + 3 (share the micro-structure maths) ---------------------------
       bool   t_touch = false, t_hold = false, t_noext = false;
       bool   t_struct = false, t_reclaim = false, t_mom = false;
       double t_touch_v = 0.0, t_hold_v = 0.0, t_noext_v = 0.0, t_struct_v = 0.0, t_mom_v = 0.0;
-      if(trend_dir != 0)
+      bool   mm_beyond = false, mm_ext = false, mm_body = false, mm_close = false;
+      double mm_beyond_v = 0.0, mm_ext_v = 0.0, mm_body_v = 0.0, mm_cpos = 0.0;
+      if(m5dir != 0)
       {
-         double s = (double)trend_dir;
+         double s = (double)m5dir;
 
          double dip = (s > 0.0) ? m1[0].low : m1[0].high;
          for(int i = 1; i < m_cfg.lookback_bars; i++)
@@ -217,26 +225,36 @@ public:
          double body = s * (close0 - m1[0].open);
          t_mom_v = (avg_range > 0.0) ? (body / avg_range) : 0.0;
          t_mom   = (body > 0.0 && t_mom_v >= m_cfg.min_body_frac);
-      }
 
-      // ---- 4. MODE 2: liquidity sweep reversal ----------------------------------
+         // Momentum burst
+         mm_body_v   = t_mom_v;
+         mm_body     = (body > 0.0 && mm_body_v >= m_cfg.mom_body_mult);
+         mm_beyond_v = s * (close0 - ema9) / atr;
+         mm_beyond   = (mm_beyond_v > 0.0);
+         mm_ext_v    = mm_beyond_v;
+         mm_ext      = (mm_ext_v <= m_cfg.mom_max_ext);
+         mm_cpos     = (rng0 > 0.0) ? ((s > 0.0) ? (close0 - m1[0].low) / rng0 : (m1[0].high - close0) / rng0) : 0.0;
+         mm_close    = (mm_cpos >= m_cfg.mom_close_pos);
+      }
+      bool pb_ready  = (m5dir != 0) && t_touch && t_hold && t_noext && t_mom && (t_struct || t_reclaim);
+      bool mom_ready = m_cfg.mom_enabled && (m5dir != 0) && mm_beyond && mm_ext && mm_body && t_struct && mm_close;
+
+      // ---- 5. MODE 2: liquidity sweep reversal (both directions, any tradable regime) ----
       SSweepProbe best;
       best.valid = false; best.score = -1; best.s = 0.0; best.name = ""; best.price = 0.0;
       best.depth = -99.0; best.extreme = 0.0; best.swept = false; best.in_range = false;
       best.reclaim = false; best.reject = false; best.close_pos = 0.0; best.disp = false; best.disp_x = 0.0;
       bool sweep_ready = false;
 
-      if(m_cfg.sweep_enabled && (trend_dir != 0 || is_range))
+      if(m_cfg.sweep_enabled)
       {
-         double rng0 = m1[0].high - m1[0].low;
+         double dispx = (avg_range > 0.0) ? rng0 / avg_range : 0.0;
          for(int d = 0; d < 2; d++)
          {
             double s = (d == 0) ? 1.0 : -1.0;
-            if(trend_dir != 0 && (int)s != trend_dir) continue;     // inside a trend: with-trend sweeps only
 
-            double ext = (s > 0.0) ? MathMin(m1[0].low, m1[1].low) : MathMax(m1[0].high, m1[1].high);
+            double ext  = (s > 0.0) ? MathMin(m1[0].low, m1[1].low) : MathMax(m1[0].high, m1[1].high);
             double cpos = (rng0 > 0.0) ? ((s > 0.0) ? (close0 - m1[0].low) / rng0 : (m1[0].high - close0) / rng0) : 0.0;
-            double dispx = (avg_range > 0.0) ? rng0 / avg_range : 0.0;
             bool   dir_candle = (s * (close0 - m1[0].open) > 0.0);
 
             for(int li = 0; li < m_ctx.lv_n; li++)
@@ -275,13 +293,16 @@ public:
          }
       }
 
-      // ---- 5. Choose the mode that drives the panel and the trade -----------------
-      if(sweep_ready)            out.mode = 2;
-      else if(trend_dir != 0)    out.mode = 1;
-      else                       out.mode = 2;     // RANGE: show the sweep search
+      // ---- 6. Choose the mode that drives the panel and the trade -------------------------
+      //        priority when several are ready: sweep > pullback > momentum
+      if(sweep_ready)        out.mode = 2;
+      else if(pb_ready)      out.mode = 1;
+      else if(mom_ready)     out.mode = 3;
+      else if(m5dir != 0)    out.mode = 1;      // show the pullback checklist while hunting
+      else                   out.mode = 2;      // mixed micro-trend: show the sweep hunt
 
       double dir_s = 0.0;
-      if(out.mode == 1) dir_s = (double)trend_dir;
+      if(out.mode == 1 || out.mode == 3) dir_s = (double)m5dir;
       else if(best.valid) dir_s = best.s;
       out.direction = (dir_s > 0.0) ? DIR_LONG : ((dir_s < 0.0) ? DIR_SHORT : DIR_NONE);
 
@@ -289,7 +310,7 @@ public:
 
       if(out.mode == 1)
       {
-         out.mode_name = "TREND PULLBACK";
+         out.mode_name = "PULLBACK";
          out.loc_title = "M5 LOCATION";
          out.trg_title = "M1 TRIGGER";
          out.rule      = "Trigger = Momentum AND (Structure OR Reclaim).  Values in ATR(M5).";
@@ -305,6 +326,24 @@ public:
          out.trigger_ok  = (t_mom && (t_struct || t_reclaim));
          out.trg_n       = (t_mom ? 1 : 0) + ((t_struct || t_reclaim) ? 1 : 0);
       }
+      else if(out.mode == 3)
+      {
+         out.mode_name = "MOMENTUM";
+         out.loc_title = "M5 TREND";
+         out.trg_title = "M1 IMPULSE";
+         out.rule      = "Impulse = big body + closes near its extreme + breaks the micro swing.";
+
+         out.ck_label[0] = "Micro-trend";      out.ck_value[0] = (m5dir > 0) ? "UP" : "DOWN";                                      out.ck_pass[0] = (m5dir != 0);
+         out.ck_label[1] = "Beyond M5 EMA9";   out.ck_value[1] = StringFormat("%+.2f ATR", mm_beyond_v);                            out.ck_pass[1] = mm_beyond;
+         out.ck_label[2] = "Not overextended"; out.ck_value[2] = StringFormat("%.2f / %.2f", mm_ext_v, m_cfg.mom_max_ext);          out.ck_pass[2] = mm_ext;
+         out.ck_label[3] = "Impulse body";     out.ck_value[3] = StringFormat("%.1fx / %.1fx", mm_body_v, m_cfg.mom_body_mult);     out.ck_pass[3] = mm_body;
+         out.ck_label[4] = "Structure break";  out.ck_value[4] = StringFormat("%+.2f ATR", t_struct_v);                             out.ck_pass[4] = t_struct;
+         out.ck_label[5] = "Closes near high"; out.ck_value[5] = StringFormat("%.0f%% / %.0f%%", mm_cpos * 100.0, m_cfg.mom_close_pos * 100.0); out.ck_pass[5] = mm_close;
+
+         out.location_ok = (m5dir != 0 && mm_beyond && mm_ext);
+         out.trigger_ok  = (mm_body && t_struct && mm_close);
+         out.trg_n       = (mm_body ? 1 : 0) + ((t_struct && mm_close) ? 1 : 0);
+      }
       else
       {
          out.mode_name = "LIQUIDITY SWEEP";
@@ -314,12 +353,12 @@ public:
 
          if(best.valid)
          {
-            out.ck_label[0] = "Level swept";    out.ck_value[0] = StringFormat("%s %+.2f", best.name, best.depth);              out.ck_pass[0] = best.swept;
+            out.ck_label[0] = "Level swept";     out.ck_value[0] = StringFormat("%s %+.2f", best.name, best.depth);              out.ck_pass[0] = best.swept;
             out.ck_label[1] = "Not a breakdown"; out.ck_value[1] = StringFormat("%.2f / %.2f", best.depth, m_cfg.sweep_max_depth); out.ck_pass[1] = best.in_range;
-            out.ck_label[2] = "Closed back in"; out.ck_value[2] = best.reclaim ? "YES" : "NO";                                   out.ck_pass[2] = best.reclaim;
-            out.ck_label[3] = "Rejection";      out.ck_value[3] = StringFormat("%.0f%% / %.0f%%", best.close_pos * 100.0, m_cfg.sweep_close_pos * 100.0); out.ck_pass[3] = best.reject;
-            out.ck_label[4] = "Displacement";   out.ck_value[4] = StringFormat("%.1fx / %.1fx", best.disp_x, m_cfg.sweep_disp_mult); out.ck_pass[4] = best.disp;
-            out.ck_label[5] = "H1 bias fit";    out.ck_value[5] = bias_fit ? "OK" : "OPPOSED";                                   out.ck_pass[5] = bias_fit;
+            out.ck_label[2] = "Closed back in";  out.ck_value[2] = best.reclaim ? "YES" : "NO";                                   out.ck_pass[2] = best.reclaim;
+            out.ck_label[3] = "Rejection";       out.ck_value[3] = StringFormat("%.0f%% / %.0f%%", best.close_pos * 100.0, m_cfg.sweep_close_pos * 100.0); out.ck_pass[3] = best.reject;
+            out.ck_label[4] = "Displacement";    out.ck_value[4] = StringFormat("%.1fx / %.1fx", best.disp_x, m_cfg.sweep_disp_mult); out.ck_pass[4] = best.disp;
+            out.ck_label[5] = "H1 bias fit";     out.ck_value[5] = bias_fit ? "OK" : "OPPOSED";                                   out.ck_pass[5] = bias_fit;
             out.location_ok = (best.swept && best.in_range && best.reclaim);
             out.trigger_ok  = (best.reject && best.disp && bias_fit);
             out.trg_n       = (best.reject ? 1 : 0) + (best.disp ? 1 : 0);
@@ -339,7 +378,7 @@ public:
          out.reason = StringFormat("Sweep of %s already traded in the last 10 minutes", best.name);
       }
 
-      // ---- 6. Context filters ------------------------------------------------------
+      // ---- 7. Context filters ------------------------------------------------------------
       int dir_i = (int)dir_s;
       out.h1_bias      = m_ctx.h1_bias;
       out.ctx_bias_ok  = bias_fit;
@@ -362,20 +401,19 @@ public:
       else if(!out.ctx_room_ok)
          out.ctx_reason = StringFormat("Only %.2f ATR of room before %s (need %.2f)", out.room_atr, out.room_level, m_cfg.min_room_atr);
 
-      // ---- 7. Confluence grade ----------------------------------------------------
+      // ---- 8. Confluence grade --------------------------------------------------------------
       int pts = 0;
-      if(dir_i != 0 && m_ctx.h1_bias == dir_i)                          pts++;   // H1 trend agrees
-      if(m_ctx.session_prime)                                           pts++;   // London open / overlap liquidity
-      if(out.room_atr >= 2.0 * m_cfg.min_room_atr)                      pts++;   // clear runway
-      if(out.mode == 1 && regime.adx_m15 >= 25.0)                       pts++;   // established trend
-      if(out.mode == 2 && trend_dir != 0 && trend_dir == dir_i)         pts++;   // sweep with the trend
+      if(dir_i != 0 && m_ctx.h1_bias == dir_i)                pts++;   // H1 trend agrees
+      if(m_ctx.session_prime)                                 pts++;   // London open / overlap liquidity
+      if(out.room_atr >= 2.0 * m_cfg.min_room_atr)            pts++;   // clear runway
+      if(dir_i != 0 && out.regime_dir == dir_i)               pts++;   // slow M15 regime agrees too
       if(pts > 4) pts = 4;
       out.grade_pts = pts;
       out.grade     = (pts >= 3) ? "A" : ((pts == 2) ? "B" : "C");
       out.risk_mult = (pts >= 3) ? 1.0 : ((pts == 2) ? 0.75 : 0.5);
       bool grade_ok = (pts >= m_cfg.min_grade_pts);
 
-      // ---- 8. Protective stop ----------------------------------------------------------
+      // ---- 9. Protective stop ------------------------------------------------------------------
       if(dir_i != 0)
       {
          double s = (double)dir_i;
@@ -403,20 +441,29 @@ public:
          out.sl_price = NormalizeDouble(entry - s * sl_dist, digits);
       }
 
-      // ---- 9. Reason (first missing ingredient) ---------------------------------------
+      // ---- 10. Reason (first missing ingredient) -----------------------------------------------
       if(out.reason == "")
       {
          if(out.mode == 1)
          {
-            if(!t_touch)        out.reason = StringFormat("No pullback into M5 EMA9 zone (%.2f > %.2f ATR)", t_touch_v, m_cfg.zone_atr);
+            if(!t_touch)        out.reason = StringFormat("No pullback into M5 EMA9 zone (%.2f > %.2f ATR) - watching for a sweep or impulse", t_touch_v, m_cfg.zone_atr);
             else if(!t_hold)    out.reason = StringFormat("Trend support lost: %.2f ATR vs M5 EMA21 (min %.2f)", t_hold_v, -m_cfg.hold_atr);
             else if(!t_noext)   out.reason = StringFormat("Price extended %.2f ATR from M5 EMA9 - not chasing (max %.2f)", t_noext_v, m_cfg.max_ext_atr);
             else if(!t_mom)     out.reason = StringFormat("M1 momentum candle missing (body %.2f of avg range, need %.2f)", t_mom_v, m_cfg.min_body_frac);
             else if(!(t_struct || t_reclaim)) out.reason = "M1 structure break / EMA9 reclaim missing";
          }
+         else if(out.mode == 3)
+         {
+            if(!mm_beyond)      out.reason = "Price not beyond M5 EMA9 in the micro-trend direction";
+            else if(!mm_ext)    out.reason = StringFormat("Impulse already overextended (%.2f ATR from EMA9, max %.2f)", mm_ext_v, m_cfg.mom_max_ext);
+            else if(!mm_body)   out.reason = StringFormat("Impulse body too small (%.1fx avg range, need %.1fx)", mm_body_v, m_cfg.mom_body_mult);
+            else if(!t_struct)  out.reason = "Impulse did not break the micro swing";
+            else if(!mm_close)  out.reason = StringFormat("Impulse closed weak (%.0f%% of range, need %.0f%%)", mm_cpos * 100.0, m_cfg.mom_close_pos * 100.0);
+         }
          else if(best.valid)
          {
-            if(!best.swept)         out.reason = StringFormat("Waiting for a liquidity sweep - nearest %s (%+.2f ATR)", best.name, best.depth);
+            string idle = (m5dir == 0) ? "M5 micro-trend is mixed. " : "";
+            if(!best.swept)         out.reason = StringFormat("%sWaiting for a liquidity sweep - nearest %s (%+.2f ATR)", idle, best.name, best.depth);
             else if(!best.in_range) out.reason = StringFormat("%s broke by %.2f ATR - a breakdown, not a sweep", best.name, best.depth);
             else if(!best.reclaim)  out.reason = StringFormat("%s swept but price has not closed back inside", best.name);
             else if(!best.reject)   out.reason = StringFormat("%s swept - rejection weak (close %.0f%%, need %.0f%%)", best.name, best.close_pos * 100.0, m_cfg.sweep_close_pos * 100.0);
@@ -441,11 +488,11 @@ public:
          return false;
       }
 
-      // ---- 10. Signal -----------------------------------------------------------------------
+      // ---- 11. Signal ---------------------------------------------------------------------------
       signal.valid        = true;
       signal.direction    = out.direction;
       signal.sl_price     = out.sl_price;
-      signal.sub_type     = (out.mode == 2) ? "SWEEP" : "M1SCALP";
+      signal.sub_type     = (out.mode == 2) ? "SWEEP" : ((out.mode == 3) ? "MOMENTUM" : "M1SCALP");
       signal.risk_mult    = out.risk_mult;
       signal.score        = pts;
       if(out.mode == 2)
@@ -456,21 +503,19 @@ public:
                                             DirectionToString(out.direction), best.name, best.depth,
                                             best.close_pos * 100.0, best.disp_x, m_ctx.h1_bias, out.room_atr, out.grade);
       }
+      else if(out.mode == 3)
+      {
+         signal.pass_details = StringFormat("MOMENTUM %s | body %.1fx | close %.0f%% | beyond EMA9 %.2f ATR | brk %+.2f | H1 %+d | room %.1f ATR | grade %s",
+                                            DirectionToString(out.direction), mm_body_v, mm_cpos * 100.0, mm_beyond_v,
+                                            t_struct_v, m_ctx.h1_bias, out.room_atr, out.grade);
+      }
       else
       {
-         signal.pass_details = StringFormat("M1SCALP %s | pullback %.2f/%.2f | hold %.2f | ext %.2f | brk %+.2f %s | mom %.2f/%.2f | H1 %+d | room %.1f ATR | grade %s",
+         signal.pass_details = StringFormat("PULLBACK %s | pullback %.2f/%.2f | hold %.2f | ext %.2f | brk %+.2f %s | mom %.2f/%.2f | H1 %+d | room %.1f ATR | grade %s",
                                             DirectionToString(out.direction), t_touch_v, m_cfg.zone_atr, t_hold_v, t_noext_v,
                                             t_struct_v, t_reclaim ? "RECLAIM" : "", t_mom_v, m_cfg.min_body_frac,
                                             m_ctx.h1_bias, out.room_atr, out.grade);
       }
       return true;
-   }
-
-private:
-   bool Fail(SScalpState &out, SSignalResult &signal, const string code)
-   {
-      signal.fail_code    = code;
-      signal.fail_details = out.reason;
-      return false;
    }
 };

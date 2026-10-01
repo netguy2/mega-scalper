@@ -408,7 +408,7 @@ private:
       }
       else if(!sc.location_ok)
       {
-         title  = (sc.mode == 2) ? "HUNTING A LIQUIDITY SWEEP" : "WAITING FOR PULLBACK";
+         title  = (sc.mode == 2) ? "HUNTING A LIQUIDITY SWEEP" : "WAITING FOR PULLBACK / IMPULSE";
          reason = sc.reason;
          accent = COL_AMB; tint = TINT_AMB;
       }
@@ -516,14 +516,20 @@ private:
       string labels[4];
       string vals[4];
       int    stg[4];
-      labels[0] = "REGIME";
+      labels[0] = "M5 BIAS";
       labels[1] = sc.regime_ok ? sc.loc_title : "LOCATION";
       labels[2] = sc.regime_ok ? sc.trg_title : "TRIGGER";
       labels[3] = "EXECUTION";
 
-      // 1. Regime (tradable = trend, or range while sweeps are enabled)
-      vals[0] = RegimeShort(rg.active_regime);
-      stg[0]  = sc.regime_ok ? ST_PASS : ((rg.active_regime == REGIME_CHAOS) ? ST_BLOCK : ST_WAIT);
+      // 1. Fast M5 micro-trend (the slow M15 regime is shown in the context grid)
+      if(!sc.regime_ok)
+      {
+         vals[0] = RegimeShort(rg.active_regime);
+         stg[0]  = (rg.active_regime == REGIME_CHAOS) ? ST_BLOCK : ST_WAIT;
+      }
+      else if(sc.m5_dir > 0) { vals[0] = "M5 UP";   stg[0] = ST_PASS; }
+      else if(sc.m5_dir < 0) { vals[0] = "M5 DOWN"; stg[0] = ST_PASS; }
+      else                   { vals[0] = "MIXED";   stg[0] = ST_WAIT; }
 
       // 2. Location / liquidity level
       if(!sc.regime_ok) { vals[1] = "--"; stg[1] = ST_IDLE; }
@@ -619,7 +625,7 @@ private:
       bool have_dir = (sc.regime_ok && sc.direction != DIR_NONE);
 
       PutText("GS_H", "CONTEXT & GATES", m_x + 14, cy, COL_MUTE, 7, true);
-      PutText("GS_HR", have_dir ? StringFormat("grade %s  x%.2f risk", sc.grade, sc.risk_mult) : "", m_x + 14 + iw, cy, COL_SUB, 7, false, 1);
+      PutText("GS_HR", have_dir ? StringFormat("%s  |  grade %s  x%.2f risk", sc.mode_name, sc.grade, sc.risk_mult) : "", m_x + 14 + iw, cy, COL_SUB, 7, false, 1);
       int y1 = cy + 15;
       int y2 = y1 + 30;
       int x  = m_x + 14;
@@ -644,7 +650,7 @@ private:
       GateChip("N", "NEWS",    g.g4_news ? "CLEAR" : "BLACKOUT", g.g4_news ? ST_PASS : ST_BLOCK, x + 2 * cw, y2);
       GateChip("K", "RISK",    StringFormat("%d/%d pos", g.open_positions, g.max_positions),
                in_trade ? ST_LIVE : (g.g6_risk ? ST_PASS : ST_BLOCK), x + 3 * cw, y2);
-      GateChip("M", "MODE",    sc.regime_ok ? ((sc.mode == 2) ? "SWEEP" : "TREND") : "--", sc.regime_ok ? ST_LIVE : ST_IDLE, x + 4 * cw, y2);
+      GateChip("M", "M15 REGIME", RegimeShort(m_last_regime.active_regime), (sc.regime_dir != 0 && sc.regime_dir == (int)sc.direction) ? ST_PASS : ST_IDLE, x + 4 * cw, y2);
       return y2 + 34;
    }
 
@@ -734,7 +740,7 @@ private:
          else if(pos.stage == STAGE_2_PARTIAL_CLOSE) stage = "PARTIAL";
          else if(pos.stage == STAGE_3_ATR_TRAIL) stage = "ATR TRAIL";
 
-         string mtag = (pos.mode == 2) ? "SWEEP" : ((pos.mode == 1) ? "TREND" : "M5");
+         string mtag = (pos.mode == 2) ? "SWEEP" : ((pos.mode == 3) ? "MOMENTUM" : ((pos.mode == 1) ? "PULLBACK" : "M5"));
          PutText("PS_A", StringFormat("%s  %.2f lots  [%s]", DirectionToString(pos.direction), pos.current_lots, mtag), m_x + 26, cy + 8, dc, 9, true);
          PutText("PS_B", StringFormat("%s  (%+.0f pts)", Money(pnl), pts), m_x + 14 + iw - 12, cy + 8, pc, 9, true, 1);
          PutText("PS_C", StringFormat("Entry %.2f   SL %.2f   Stage: %s", pos.entry_price, pos.current_sl, stage), m_x + 26, cy + 29, COL_SUB, 8);

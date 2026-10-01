@@ -33,6 +33,7 @@ input group "=== RESEARCH / TEST MODE ==="
 input bool     InpContinuousResearchMode  = true;   // Continuous Mode (No daily loss/DD brakes)
 input bool     InpEnableOnChartPanel      = true;   // Show Interactive Control Panel
 input bool     InpEnableDecisionLog       = true;   // Write Full Decision Audit to File
+input bool     InpAutoStart               = true;   // Start in RUNNING state on every attach / recompile (entries enabled)
 
 //+------------------------------------------------------------------+
 //| 1. PARAMETER BUDGET: MODULE 1 - REGIME ENGINE (12)               |
@@ -102,14 +103,20 @@ input int      InpNewsBlackoutMin         = 30;     // 38. news_blackout_min
 //+------------------------------------------------------------------+
 input group "=== SCALP ENGINE: ENTRY (M1 TRIGGER LAYER) ==="
 input bool     InpScalpEnabled            = true;   // Enable the M1 scalp layer (both modes below)
-input int      InpScalpLookbackM1         = 8;      // [Trend] M1 bars scanned for the pullback extreme
-input int      InpScalpSwingBarsM1        = 4;      // [Trend] M1 bars defining the micro swing high/low
-input double   InpScalpZoneATR            = 0.30;   // [Trend] Pullback must reach M5 EMA9 + zone*ATR(M5)
-input double   InpScalpHoldATR            = 0.50;   // [Trend] Max break of M5 EMA21 tolerated (ATR) before trend is "lost"
-input double   InpScalpMaxExtATR          = 1.20;   // [Trend] Do not chase beyond M5 EMA9 + this*ATR(M5)
-input double   InpScalpMinBodyFrac        = 0.60;   // [Trend] Trigger candle body >= frac * avg M1 range
+input int      InpScalpLookbackM1         = 8;      // [Pullback] M1 bars scanned for the pullback extreme
+input int      InpScalpSwingBarsM1        = 4;      // [Pullback/Momentum] M1 bars defining the micro swing high/low
+input double   InpScalpZoneATR            = 0.60;   // [Pullback] Pullback must reach M5 EMA9 + zone*ATR(M5)
+input double   InpScalpHoldATR            = 1.00;   // [Pullback] Max break of M5 EMA21 tolerated (ATR) before trend is "lost"
+input double   InpScalpMaxExtATR          = 1.20;   // [Pullback] Do not chase beyond M5 EMA9 + this*ATR(M5)
+input double   InpScalpMinBodyFrac        = 0.50;   // [Pullback] Trigger candle body >= frac * avg M1 range
 input double   InpScalpSLBufferATR        = 0.10;   // Stop buffer beyond the micro swing / sweep wick (ATR M5)
 input double   InpScalpMinSLATR           = 0.60;   // Minimum stop distance (ATR M5)
+
+input group "=== SCALP ENGINE: MOMENTUM-BURST MODE ==="
+input bool     InpMomentumEnabled         = true;   // Trade impulse continuations in the M5 micro-trend direction
+input double   InpMomBodyMult             = 1.30;   // Impulse candle body >= mult * average M1 range
+input double   InpMomMaxExtATR            = 2.50;   // Skip if already stretched beyond M5 EMA9 by this (ATR M5)
+input double   InpMomClosePos             = 0.70;   // Impulse must close in the top/bottom 30% of its range
 
 input group "=== SCALP ENGINE: LIQUIDITY SWEEP MODE ==="
 input bool     InpSweepEnabled            = true;   // Trade stop-hunt reversals at key levels (also active in RANGE)
@@ -121,8 +128,8 @@ input double   InpRoundStep               = 50.0;   // Round-number level spacin
 
 input group "=== SCALP ENGINE: CONTEXT FILTERS ==="
 input bool     InpUseH1Bias               = true;   // Block trades against the H1 EMA50/EMA200 bias
-input double   InpScalpMinRoomATR         = 0.80;   // Require this much free space (ATR M5) to the next key level
-input double   InpScalpRSIMax             = 78.0;   // No buys above / sells below (100-x) RSI(M1): exhaustion
+input double   InpScalpMinRoomATR         = 0.50;   // Require this much free space (ATR M5) to the next key level
+input double   InpScalpRSIMax             = 85.0;   // No buys above / sells below (100-x) RSI(M1): exhaustion
 input double   InpScalpMinATRUsd          = 0.80;   // Dead-market floor: ATR(M5) in $ must exceed this
 input int      InpScalpMinGradePts        = 0;      // Minimum confluence points (0=any, 2=B+, 3=A only)
 input int      InpScalpLossCooldownMin    = 3;      // After a loss wait N min x consecutive losses (max x3), 0=off
@@ -476,6 +483,10 @@ int OnInit()
    scfg.enabled         = InpScalpEnabled;
    scfg.sweep_enabled   = InpSweepEnabled;
    scfg.use_h1_bias     = InpUseH1Bias;
+   scfg.mom_enabled     = InpMomentumEnabled;
+   scfg.mom_body_mult   = InpMomBodyMult;
+   scfg.mom_max_ext     = InpMomMaxExtATR;
+   scfg.mom_close_pos   = InpMomClosePos;
    scfg.lookback_bars   = InpScalpLookbackM1;
    scfg.swing_bars      = InpScalpSwingBarsM1;
    scfg.zone_atr        = InpScalpZoneATR;
@@ -539,6 +550,13 @@ int OnInit()
                   &g_risk_engine,
                   &g_gates,
                   &g_trade_manager);
+
+   // Entries ON from the first tick (the panel STOP button is a deliberate operator action)
+   if(InpAutoStart)
+      g_exec_sm.SetRunState(EA_STATE_RUNNING);
+   g_logger.LogEvent("INIT", StringFormat("Run state at start: %s (InpAutoStart=%s)",
+                     (g_exec_sm.GetRunState() == EA_STATE_RUNNING) ? "RUNNING" : "STOPPED",
+                     InpAutoStart ? "true" : "false"));
 
    // 11. Execute Instant Baseline Calculation (Zero Cold-Start Delay)
    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);

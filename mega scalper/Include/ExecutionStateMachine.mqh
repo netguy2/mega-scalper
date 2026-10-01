@@ -96,7 +96,11 @@ public:
 
    void SetRunState(ENUM_EA_RUN_STATE state)
    {
+      ENUM_EA_RUN_STATE previous = m_run_state;
       m_run_state = state;
+      if(previous != state)
+         PrintFormat("[RUNSTATE] %s -> %s", (previous == EA_STATE_RUNNING) ? "RUNNING" : "STOPPED",
+                                            (state == EA_STATE_RUNNING) ? "RUNNING" : "STOPPED");
       // Pressing START is the operator's explicit "try again": clear the >=3 rejection latch,
       // which previously had no way back except re-attaching the EA.
       if(state == EA_STATE_RUNNING)
@@ -328,7 +332,8 @@ public:
                                                lots,
                                                is_indivisible,
                                                (m_pending_signal.sub_type == "SWEEP") ? 2 :
-                                               ((m_pending_signal.sub_type == "M1SCALP") ? 1 : 0));
+                                               ((m_pending_signal.sub_type == "MOMENTUM") ? 3 :
+                                               ((m_pending_signal.sub_type == "M1SCALP") ? 1 : 0)));
                m_state = STATE_MANAGED;
             }
             else

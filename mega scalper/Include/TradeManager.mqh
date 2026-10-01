@@ -210,7 +210,7 @@ public:
                m_pos.indivisible  = (m_pos.current_lots < (2.0 * lot_step));
 
                string comment = PositionGetString(POSITION_COMMENT);
-               m_pos.mode = (StringFind(comment, "_SWEEP") >= 0) ? 2 : ((StringFind(comment, "_M1SCALP") >= 0) ? 1 : 0);
+               m_pos.mode = (StringFind(comment, "_SWEEP") >= 0) ? 2 : ((StringFind(comment, "_MOMENTUM") >= 0) ? 3 : ((StringFind(comment, "_M1SCALP") >= 0) ? 1 : 0));
                if(StringFind(comment, "ENG_A") >= 0) m_pos.engine = ENGINE_A_TREND_PULLBACK;
                else if(StringFind(comment, "ENG_B") >= 0) m_pos.engine = ENGINE_B_BREAKOUT;
                else if(StringFind(comment, "ENG_C") >= 0) m_pos.engine = ENGINE_C_MEAN_REVERSION;

@@ -192,6 +192,11 @@ struct SScalpConfig
    bool     enabled;
    bool     sweep_enabled;
    bool     use_h1_bias;
+   // momentum-burst mode
+   bool     mom_enabled;
+   double   mom_body_mult;
+   double   mom_max_ext;
+   double   mom_close_pos;
    // trend-pullback mode
    int      lookback_bars;
    int      swing_bars;
@@ -227,9 +232,11 @@ struct SScalpConfig
 struct SScalpState
 {
    ENUM_TRADE_DIRECTION direction;      // trade direction under evaluation
-   int      mode;                       // 0 none, 1 trend pullback, 2 liquidity sweep
+   int      mode;                       // 0 none, 1 pullback, 2 liquidity sweep, 3 momentum burst
    string   mode_name;
-   bool     regime_ok;                  // regime is tradable by the scalp layer
+   bool     regime_ok;                  // regime is tradable by the scalp layer (not CHAOS)
+   int      m5_dir;                     // fast M5 micro-trend: +1 up, -1 down, 0 mixed
+   int      regime_dir;                 // slow M15 regime direction (grade input only)
 
    string   loc_title;
    string   trg_title;
@@ -269,7 +276,7 @@ struct SScalpState
 
    void Reset(void)
    {
-      direction = DIR_NONE; mode = 0; mode_name = "-"; regime_ok = false;
+      direction = DIR_NONE; mode = 0; mode_name = "-"; regime_ok = false; m5_dir = 0; regime_dir = 0;
       loc_title = "LOCATION"; trg_title = "TRIGGER"; rule = "";
       for(int i = 0; i < 6; i++) { ck_label[i] = "-"; ck_value[i] = "--"; ck_pass[i] = false; }
       loc_n = 0; trg_n = 0; location_ok = false; trigger_ok = false;
@@ -369,7 +376,7 @@ struct SPositionTrack
    int                  bars_held_m5;
    bool                 indivisible;
    bool                 active;
-   int                  mode;          // 0 = legacy M5 engines, 1 = trend-pullback scalp, 2 = liquidity sweep
+   int                  mode;          // 0 = legacy M5 engines, 1 = pullback, 2 = liquidity sweep, 3 = momentum burst
 };
 
 //--- Per-Engine Attribution Metrics
