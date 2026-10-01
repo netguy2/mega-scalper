@@ -91,9 +91,16 @@ public:
    ENUM_EXEC_STATE   GetState(void) const { return m_state; }
    ENUM_EA_RUN_STATE GetRunState(void) const { return m_run_state; }
 
+   bool IsSessionDisabled(void) const { return m_session_disabled; }
+   int  GetSessionRejections(void) const { return m_rejection_count_session; }
+
    void SetRunState(ENUM_EA_RUN_STATE state)
    {
       m_run_state = state;
+      // Pressing START is the operator's explicit "try again": clear the >=3 rejection latch,
+      // which previously had no way back except re-attaching the EA.
+      if(state == EA_STATE_RUNNING)
+         ResetSessionRejections();
       if(m_logger != NULL)
       {
          string s = (state == EA_STATE_RUNNING) ? "RUNNING" :

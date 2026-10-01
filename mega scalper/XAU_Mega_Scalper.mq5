@@ -20,6 +20,7 @@
 #include "Include/EngineA_TrendPullback.mqh"
 #include "Include/EngineB_Breakout.mqh"
 #include "Include/EngineC_MeanReversion.mqh"
+#include "Include/ScalpEngine.mqh"
 #include "Include/RiskEngine.mqh"
 #include "Include/TradeManager.mqh"
 #include "Include/ExecutionStateMachine.mqh"
@@ -96,6 +97,20 @@ input int      InpCooldownBars            = 0;      // 36. cooldown_bars (0 for 
 input int      InpMaxPositions            = 1;      // 37. max_positions (Global 1 hard cap)
 input int      InpNewsBlackoutMin         = 30;     // 38. news_blackout_min
 
+//+------------------------------------------------------------------+
+//| SCALP ENGINE: M15 bias -> M5 location -> M1 micro-trigger        |
+//+------------------------------------------------------------------+
+input group "=== SCALP ENGINE (M1 TRIGGER LAYER) ==="
+input bool     InpScalpEnabled            = true;   // Enable M1 scalp triggers (trades inside TREND_UP / TREND_DN)
+input int      InpScalpLookbackM1         = 8;      // M1 bars scanned for the pullback extreme
+input int      InpScalpSwingBarsM1        = 4;      // M1 bars defining the micro swing high/low
+input double   InpScalpZoneATR            = 0.30;   // Pullback must reach M5 EMA9 + zone*ATR(M5)
+input double   InpScalpHoldATR            = 0.50;   // Max break of M5 EMA21 tolerated (ATR) before trend is "lost"
+input double   InpScalpMaxExtATR          = 1.20;   // Do not chase beyond M5 EMA9 + this*ATR(M5)
+input double   InpScalpMinBodyFrac        = 0.60;   // Trigger candle body >= frac * avg M1 range
+input double   InpScalpSLBufferATR        = 0.10;   // Stop buffer beyond micro swing (ATR M5)
+input double   InpScalpMinSLATR           = 0.60;   // Minimum stop distance (ATR M5)
+
 //--- Operational Settings
 input group "=== OPERATIONAL CONSTANTS ==="
 input ulong    InpMagicNumber             = 202601; // Magic Number
@@ -113,6 +128,7 @@ CEngineC_MeanReversion  g_engine_c;
 CRiskEngine             g_risk_engine;
 CTradeManager           g_trade_manager;
 CExecutionStateMachine  g_exec_sm;
+CScalpEngine           g_scalp_engine;
 CPanelGUI               g_panel;
 
 //--- State & Telemetry Tracking
@@ -124,6 +140,10 @@ SStrategyDiagnostic     g_diagnostic;
 SDrySignal              g_dry_a;
 SDrySignal              g_dry_b;
 SDrySignal              g_dry_c;
+SScalpState             g_scalp;
+SFunnel                 g_funnel;
+datetime                g_last_m1_bar_time = 0;
+datetime                g_funnel_day       = 0;
 
 //+------------------------------------------------------------------+
 //| Update Strategy Diagnostics & Dry Candidate Scans (§9 & §12)     |
@@ -223,6 +243,90 @@ void UpdateStrategyDiagnostic(void)
 }
 
 //+------------------------------------------------------------------+
+//| Daily funnel reset (server day)                                  |
+//+------------------------------------------------------------------+
+void ResetFunnelIfNewDay(void)
+{
+   MqlDateTime mdt;
+   TimeToStruct(TimeCurrent(), mdt);
+   mdt.hour = 0;
+   mdt.min  = 0;
+   mdt.sec  = 0;
+   datetime day_start = StructToTime(mdt);
+   if(day_start != g_funnel_day)
+   {
+      g_funnel_day = day_start;
+      g_funnel.Reset();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| M1 scalp pipeline - runs once per closed M1 bar                  |
+//|   gates -> M15 regime bias -> M5 location -> M1 trigger -> send  |
+//| Every exit increments exactly one funnel bucket so the panel can |
+//| show where each bar died.                                        |
+//+------------------------------------------------------------------+
+void RunScalpPipeline(double spread_pts, double point)
+{
+   ResetFunnelIfNewDay();
+   g_funnel.scanned++;
+
+   bool gates_ok = g_gates.EvaluateAllGates(g_data, g_regime_state, spread_pts, point, g_gate_results);
+
+   // Always evaluate: the panel shows the live checklist even while a gate blocks entry
+   SSignalResult sig;
+   g_scalp_engine.Evaluate(g_data, g_regime_state, g_scalp, sig);
+
+   if(!gates_ok)
+   {
+      string fg = g_gate_results.fail_gate;
+      if(fg == "G1_WARMUP")       g_funnel.warmup_blocked++;
+      else if(fg == "G2_SESSION") g_funnel.session_blocked++;
+      else if(fg == "G3_SPREAD")  g_funnel.spread_blocked++;
+      else if(fg == "G4_NEWS")    g_funnel.news_blocked++;
+      else if(fg == "G5_REGIME")  g_funnel.regime_blocked++;
+      else if(fg == "G6_RISK")
+      {
+         // The 1-position cap trips G6 for every bar of an open trade: that is not a "risk block"
+         if(g_trade_manager.HasActivePosition()) g_funnel.in_trade++;
+         else                                    g_funnel.risk_blocked++;
+      }
+      else                        g_funnel.exec_blocked++;
+      return;
+   }
+   g_funnel.gates_passed++;
+
+   if(!g_scalp.regime_ok)    return;
+   g_funnel.regime_ok++;
+
+   if(!g_scalp.location_ok)  return;
+   g_funnel.location_ok++;
+
+   if(!g_scalp.trigger_ok)   return;
+   g_funnel.trigger_ok++;
+
+   if(!sig.valid)            return;
+
+   // Do not stack on a signal the M5-close path already queued this tick
+   if(g_exec_sm.GetState() == STATE_PRE_TRADE_CHECK)
+      return;
+
+   if(g_exec_sm.DispatchSignal(sig))
+   {
+      g_funnel.dispatched++;
+      g_last_signal = sig;
+      if(InpEnableDecisionLog)
+      {
+         g_dec_logger.LogTradeLifecycleEvent("SCALP_TRIGGER", sig.pass_details);
+      }
+   }
+   else
+   {
+      g_funnel.exec_blocked++;
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
@@ -310,6 +414,21 @@ int OnInit()
                    InpRejectionWickRatioMR,
                    InpMaxFadeExtensionATR);
 
+   // 7b. Initialize Scalp Engine (M1 trigger layer)
+   g_scalp_engine.Init(symbol,
+                       InpScalpEnabled,
+                       InpScalpLookbackM1,
+                       InpScalpSwingBarsM1,
+                       InpScalpZoneATR,
+                       InpScalpHoldATR,
+                       InpScalpMaxExtATR,
+                       InpScalpMinBodyFrac,
+                       InpScalpSLBufferATR,
+                       InpScalpMinSLATR,
+                       InpATRSLMult);
+   g_scalp.Reset();
+   g_funnel.Reset();
+
    // 8. Initialize Risk Engine
    g_risk_engine.Init(symbol,
                       InpRiskPerTradePct,
@@ -347,13 +466,20 @@ int OnInit()
    g_gates.EvaluateAllGates(g_data, g_regime_state, spread_pts, point, g_gate_results);
    UpdateStrategyDiagnostic();
 
+   {
+      SSignalResult init_sig;
+      g_scalp_engine.Evaluate(g_data, g_regime_state, g_scalp, init_sig);
+   }
+   g_last_m1_bar_time = iTime(symbol, PERIOD_M1, 0);
+   ResetFunnelIfNewDay();
+
    // 12. Initialize On-Chart Control Panel
    if(InpEnableOnChartPanel)
    {
       ChartSetInteger(0, CHART_EVENT_MOUSE_MOVE, true);
       ChartSetInteger(0, CHART_FOREGROUND, false);
       g_panel.Init(&g_trade_manager, &g_exec_sm, &g_dec_logger);
-      g_panel.Update(g_regime_state, g_gate_results, g_last_signal, g_diagnostic, g_dry_a, g_dry_b, g_dry_c);
+      g_panel.Update(g_regime_state, g_gate_results, g_last_signal, g_diagnostic, g_dry_a, g_dry_b, g_dry_c, g_scalp, g_funnel);
    }
 
    // 250ms Timer for UI Refresh
@@ -389,7 +515,7 @@ void OnTimer()
    if(InpEnableOnChartPanel)
    {
       UpdateStrategyDiagnostic();
-      g_panel.Update(g_regime_state, g_gate_results, g_last_signal, g_diagnostic, g_dry_a, g_dry_b, g_dry_c);
+      g_panel.Update(g_regime_state, g_gate_results, g_last_signal, g_diagnostic, g_dry_a, g_dry_b, g_dry_c, g_scalp, g_funnel);
    }
 }
 
@@ -569,7 +695,23 @@ void OnTick()
       if(InpEnableOnChartPanel)
       {
          UpdateStrategyDiagnostic();
-         g_panel.Update(g_regime_state, g_gate_results, g_last_signal, g_diagnostic, g_dry_a, g_dry_b, g_dry_c);
+         g_panel.Update(g_regime_state, g_gate_results, g_last_signal, g_diagnostic, g_dry_a, g_dry_b, g_dry_c, g_scalp, g_funnel);
+      }
+   }
+
+   // ----------------------------------------------------------------
+   // 6. M1 Scalp Pipeline (M15 bias -> M5 location -> M1 trigger)
+   //    Evaluated on every closed M1 bar, independent of the M5 close.
+   // ----------------------------------------------------------------
+   datetime current_m1_bar_time = iTime(symbol, PERIOD_M1, 0);
+   if(current_m1_bar_time != g_last_m1_bar_time)
+   {
+      g_last_m1_bar_time = current_m1_bar_time;
+      RunScalpPipeline(spread_pts, point);
+
+      if(InpEnableOnChartPanel)
+      {
+         g_panel.Update(g_regime_state, g_gate_results, g_last_signal, g_diagnostic, g_dry_a, g_dry_b, g_dry_c, g_scalp, g_funnel);
       }
    }
 }

@@ -186,6 +186,85 @@ struct SDrySignal
    string               primary_rejection_reason;
 };
 
+//--- Scalp Engine live state (M15 bias -> M5 location -> M1 trigger).
+//    Drives the panel checklist so "SCANNING" always has a concrete reason.
+struct SScalpState
+{
+   ENUM_TRADE_DIRECTION direction;      // M15-regime bias (LONG / SHORT / NONE)
+   bool     regime_ok;                  // active regime is TREND_UP / TREND_DN
+
+   // M5 location (all values in ATR_M5 units, signed so that "positive = with the trade")
+   bool     loc_touch;                  // recent M1 pullback reached the M5 EMA9 zone
+   double   loc_touch_val;
+   double   loc_touch_lim;
+   bool     loc_hold;                   // price still holding above/below M5 EMA21 band
+   double   loc_hold_val;
+   double   loc_hold_lim;
+   bool     loc_noext;                  // price not over-extended from M5 EMA9 (no chasing)
+   double   loc_noext_val;
+   double   loc_noext_lim;
+   bool     location_ok;
+
+   // M1 micro trigger
+   bool     trg_structure;              // closed beyond the micro swing high/low
+   double   trg_struct_val;
+   bool     trg_reclaim;                // reclaimed M5 EMA9 after dipping through it
+   bool     trg_momentum;               // decisive body vs average M1 range
+   double   trg_mom_val;
+   double   trg_mom_lim;
+   bool     trigger_ok;
+
+   bool     entry_ready;                // location_ok && trigger_ok
+   double   sl_price;
+   datetime eval_time;
+   string   reason;                     // first missing ingredient, human readable
+
+   void Reset(void)
+   {
+      direction     = DIR_NONE;
+      regime_ok     = false;
+      loc_touch     = false; loc_touch_val = 0.0; loc_touch_lim = 0.0;
+      loc_hold      = false; loc_hold_val  = 0.0; loc_hold_lim  = 0.0;
+      loc_noext     = false; loc_noext_val = 0.0; loc_noext_lim = 0.0;
+      location_ok   = false;
+      trg_structure = false; trg_struct_val = 0.0;
+      trg_reclaim   = false;
+      trg_momentum  = false; trg_mom_val = 0.0; trg_mom_lim = 0.0;
+      trigger_ok    = false;
+      entry_ready   = false;
+      sl_price      = 0.0;
+      eval_time     = 0;
+      reason        = "";
+   }
+};
+
+//--- Daily decision funnel: where did every scanned M1 bar die?
+struct SFunnel
+{
+   int scanned;          // M1 bars evaluated
+   int warmup_blocked;   // G1
+   int session_blocked;  // G2
+   int spread_blocked;   // G3
+   int news_blocked;     // G4
+   int regime_blocked;   // G5 (chaos / dwell)
+   int risk_blocked;     // G6 (daily DD / consec losses / cooldown)
+   int exec_blocked;     // G7 + dispatch refusals
+   int in_trade;         // bars skipped because a position was already open
+   int gates_passed;     // all gates OK
+   int regime_ok;        // ...and regime is TREND_UP / TREND_DN
+   int location_ok;      // ...and M5 location valid
+   int trigger_ok;       // ...and M1 trigger valid
+   int dispatched;       // ...entries actually sent to the execution state machine
+
+   void Reset(void)
+   {
+      scanned = 0; warmup_blocked = 0; session_blocked = 0; spread_blocked = 0;
+      news_blocked = 0; regime_blocked = 0; risk_blocked = 0; exec_blocked = 0;
+      in_trade = 0; gates_passed = 0; regime_ok = 0; location_ok = 0;
+      trigger_ok = 0; dispatched = 0;
+   }
+};
+
 //--- Live Strategy Diagnostic Structure (§9)
 struct SStrategyDiagnostic
 {

@@ -18,6 +18,8 @@ private:
    int            m_h_ema9_m15;
    int            m_h_ema21_m15;
    int            m_h_ema50_m15;
+   int            m_h_ema9_m5;
+   int            m_h_ema21_m5;
    int            m_h_adx_m15;
    int            m_h_atr_m15;
    int            m_h_atr_m5;
@@ -48,6 +50,8 @@ public:
                       m_h_ema9_m15(INVALID_HANDLE),
                       m_h_ema21_m15(INVALID_HANDLE),
                       m_h_ema50_m15(INVALID_HANDLE),
+                      m_h_ema9_m5(INVALID_HANDLE),
+                      m_h_ema21_m5(INVALID_HANDLE),
                       m_h_adx_m15(INVALID_HANDLE),
                       m_h_atr_m15(INVALID_HANDLE),
                       m_h_atr_m5(INVALID_HANDLE),
@@ -80,10 +84,17 @@ public:
       if(m_h_ema9_m15 != INVALID_HANDLE)   IndicatorRelease(m_h_ema9_m15);
       if(m_h_ema21_m15 != INVALID_HANDLE)  IndicatorRelease(m_h_ema21_m15);
       if(m_h_ema50_m15 != INVALID_HANDLE)  IndicatorRelease(m_h_ema50_m15);
+      if(m_h_ema9_m5 != INVALID_HANDLE)    IndicatorRelease(m_h_ema9_m5);
+      if(m_h_ema21_m5 != INVALID_HANDLE)   IndicatorRelease(m_h_ema21_m5);
       if(m_h_adx_m15 != INVALID_HANDLE)    IndicatorRelease(m_h_adx_m15);
       if(m_h_atr_m15 != INVALID_HANDLE)    IndicatorRelease(m_h_atr_m15);
       if(m_h_atr_m5 != INVALID_HANDLE)     IndicatorRelease(m_h_atr_m5);
       if(m_h_bands_m5 != INVALID_HANDLE)   IndicatorRelease(m_h_bands_m5);
+
+      m_h_ema9_m15 = m_h_ema21_m15 = m_h_ema50_m15 = INVALID_HANDLE;
+      m_h_ema9_m5  = m_h_ema21_m5  = INVALID_HANDLE;
+      m_h_adx_m15  = m_h_atr_m15   = m_h_atr_m5     = INVALID_HANDLE;
+      m_h_bands_m5 = INVALID_HANDLE;
    }
 
    bool Init(string symbol,
@@ -132,11 +143,13 @@ public:
 
       // M5 Indicators
       m_h_atr_m5    = iATR(m_symbol, PERIOD_M5, m_atr_period_m5);
+      m_h_ema9_m5   = iMA(m_symbol, PERIOD_M5, m_ema_fast, 0, MODE_EMA, PRICE_CLOSE);
+      m_h_ema21_m5  = iMA(m_symbol, PERIOD_M5, m_ema_mid, 0, MODE_EMA, PRICE_CLOSE);
       m_h_bands_m5  = iBands(m_symbol, PERIOD_M5, m_bb_period, 0, m_bb_sigma, PRICE_CLOSE);
 
       if(m_h_ema9_m15 == INVALID_HANDLE || m_h_ema21_m15 == INVALID_HANDLE || m_h_ema50_m15 == INVALID_HANDLE ||
          m_h_adx_m15 == INVALID_HANDLE || m_h_atr_m15 == INVALID_HANDLE || m_h_atr_m5 == INVALID_HANDLE ||
-         m_h_bands_m5 == INVALID_HANDLE)
+         m_h_bands_m5 == INVALID_HANDLE || m_h_ema9_m5 == INVALID_HANDLE || m_h_ema21_m5 == INVALID_HANDLE)
       {
          PrintFormat("[DATA_MODEL ERROR] Indicator creation failed for symbol %s. Error: %d", m_symbol, GetLastError());
          return false;
@@ -268,6 +281,17 @@ public:
       ema9  = b9[0];
       ema21 = b21[0];
       ema50 = b50[0];
+      return true;
+   }
+
+   // M5 EMAs on the last closed M5 bar (location reference for the M1 scalp layer)
+   bool GetEMA_M5(double &ema9, double &ema21)
+   {
+      double b9[1], b21[1];
+      if(CopyBuffer(m_h_ema9_m5, 0, 1, 1, b9) < 1) return false;
+      if(CopyBuffer(m_h_ema21_m5, 0, 1, 1, b21) < 1) return false;
+      ema9  = b9[0];
+      ema21 = b21[0];
       return true;
    }
 
