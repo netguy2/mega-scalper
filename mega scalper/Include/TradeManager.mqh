@@ -25,6 +25,15 @@ private:
    double         m_daily_dd_pct;
    bool           m_research_mode;
 
+   // Scalp exit configuration (positions opened by the M1 scalp layer)
+   int            m_sc_time_stop_min;
+   double         m_sc_time_stop_r;
+   double         m_sc_tp_r;
+   double         m_sc_trail_start_r;
+   double         m_sc_trail_atr;
+   int            m_sc_flatten_min;
+   bool           m_sc_adverse_exit;
+
    // Active position tracking state
    SPositionTrack m_pos;
 
@@ -40,7 +49,14 @@ public:
                          m_logger(NULL),
                          m_spread_chaos_abs_pts(450.0),
                          m_daily_dd_pct(0.03),
-                         m_research_mode(true)
+                         m_research_mode(true),
+                         m_sc_time_stop_min(15),
+                         m_sc_time_stop_r(0.20),
+                         m_sc_tp_r(2.2),
+                         m_sc_trail_start_r(1.2),
+                         m_sc_trail_atr(0.7),
+                         m_sc_flatten_min(1320),
+                         m_sc_adverse_exit(true)
    {
       ResetPositionTrack();
       ResetStatistics();
@@ -72,6 +88,20 @@ public:
       UpdateHistoryStatistics();
    }
 
+   // Exit rules that apply only to positions opened by the M1 scalp layer
+   void ConfigureScalpExits(int time_stop_min, double time_stop_r, double tp_r,
+                            double trail_start_r, double trail_atr,
+                            int flatten_min_of_day, bool adverse_exit)
+   {
+      m_sc_time_stop_min = time_stop_min;
+      m_sc_time_stop_r   = time_stop_r;
+      m_sc_tp_r          = tp_r;
+      m_sc_trail_start_r = MathMax(0.5, trail_start_r);
+      m_sc_trail_atr     = MathMax(0.2, trail_atr);
+      m_sc_flatten_min   = flatten_min_of_day;
+      m_sc_adverse_exit  = adverse_exit;
+   }
+
    void ResetPositionTrack(void)
    {
       m_pos.ticket       = 0;
@@ -89,6 +119,7 @@ public:
       m_pos.bars_held_m5 = 0;
       m_pos.indivisible  = false;
       m_pos.active       = false;
+      m_pos.mode         = 0;
    }
 
    void ResetStatistics(void)
@@ -123,8 +154,10 @@ public:
                             double entry_price,
                             double sl_price,
                             double lots,
-                            bool is_indivisible)
+                            bool is_indivisible,
+                            int mode = 0)
    {
+      m_pos.mode         = mode;
       m_pos.ticket       = ticket;
       m_pos.magic        = m_magic;
       m_pos.engine       = engine;
@@ -177,6 +210,7 @@ public:
                m_pos.indivisible  = (m_pos.current_lots < (2.0 * lot_step));
 
                string comment = PositionGetString(POSITION_COMMENT);
+               m_pos.mode = (StringFind(comment, "_SWEEP") >= 0) ? 2 : ((StringFind(comment, "_M1SCALP") >= 0) ? 1 : 0);
                if(StringFind(comment, "ENG_A") >= 0) m_pos.engine = ENGINE_A_TREND_PULLBACK;
                else if(StringFind(comment, "ENG_B") >= 0) m_pos.engine = ENGINE_B_BREAKOUT;
                else if(StringFind(comment, "ENG_C") >= 0) m_pos.engine = ENGINE_C_MEAN_REVERSION;
@@ -338,6 +372,48 @@ public:
       return true;
    }
 
+   // Flatten the tracked position at market and reset tracking
+   void ClosePositionNow(const string tag, const string message)
+   {
+      if(m_logger != NULL)
+         m_logger.LogEvent(tag, message);
+      m_trade.PositionClose(m_pos.ticket);
+      ResetPositionTrack();
+      UpdateHistoryStatistics();
+   }
+
+   //+------------------------------------------------------------------+
+   //| M1 bar close: adverse-impulse exit for scalps that are not yet   |
+   //| protected. A decisive opposite candle that closes beyond entry   |
+   //| means the setup has failed - leave at ~-0.3R instead of -1R.     |
+   //+------------------------------------------------------------------+
+   void OnM1BarClose(void)
+   {
+      if(!m_pos.active || m_pos.mode < 1 || !m_sc_adverse_exit) return;
+      if(m_pos.stage >= STAGE_1_BREAKEVEN) return;
+      if(!PositionSelectByTicket(m_pos.ticket)) return;
+
+      MqlRates r[];
+      ArraySetAsSeries(r, true);
+      if(CopyRates(m_symbol, PERIOD_M1, 1, 11, r) < 11) return;
+
+      double avg = 0.0;
+      for(int i = 1; i <= 10; i++) avg += (r[i].high - r[i].low);
+      avg /= 10.0;
+
+      double s = (m_pos.direction == DIR_LONG) ? 1.0 : -1.0;
+      double body = s * (r[0].close - r[0].open);
+      bool decisive = (avg > 0.0 && body <= -1.3 * avg);
+      bool beyond   = (s * (r[0].close - m_pos.entry_price) < 0.0);
+
+      if(decisive && beyond)
+      {
+         ClosePositionNow("ADVERSE_IMPULSE",
+                          StringFormat("Ticket #%I64u: opposite M1 impulse (%.2f vs avg range %.2f) closed beyond entry. Exiting early.",
+                                       m_pos.ticket, MathAbs(body), avg));
+      }
+   }
+
    //+------------------------------------------------------------------+
    //| Dynamic Tick Management (§11)                                    |
    //+------------------------------------------------------------------+
@@ -400,6 +476,36 @@ public:
          current_profit_price = m_pos.entry_price - current_ask;
 
       double r_mult = (m_pos.r_points > 0.0) ? (current_profit_price / m_pos.r_points) : 0.0;
+
+      // 2b. Scalp-layer exits: end-of-day flatten, time stop, final target
+      if(m_pos.mode >= 1)
+      {
+         MqlDateTime tnow;
+         TimeToStruct(TimeCurrent(), tnow);
+         int minute_of_day = tnow.hour * 60 + tnow.min;
+         int flatten_at    = (tnow.day_of_week == 5) ? (m_sc_flatten_min - 60) : m_sc_flatten_min;
+         if(m_sc_flatten_min > 0 && minute_of_day >= flatten_at)
+         {
+            ClosePositionNow("EOD_FLATTEN", StringFormat("Ticket #%I64u flattened before rollover (%02d:%02d, %.2fR).",
+                                                         m_pos.ticket, tnow.hour, tnow.min, r_mult));
+            return;
+         }
+
+         int held_min = (int)((TimeCurrent() - m_pos.open_time) / 60);
+         if(m_sc_time_stop_min > 0 && held_min >= m_sc_time_stop_min && r_mult < m_sc_time_stop_r)
+         {
+            ClosePositionNow("TIME_STOP", StringFormat("Ticket #%I64u: %d min with only %.2fR - scalp is going nowhere. Closing.",
+                                                       m_pos.ticket, held_min, r_mult));
+            return;
+         }
+
+         if(m_sc_tp_r > 0.0 && r_mult >= m_sc_tp_r)
+         {
+            ClosePositionNow("SCALP_TARGET", StringFormat("Ticket #%I64u reached %.2fR (target %.2fR). Banking the remainder.",
+                                                          m_pos.ticket, r_mult, m_sc_tp_r));
+            return;
+         }
+      }
 
       if(m_pos.engine == ENGINE_C_MEAN_REVERSION && m_pos.bars_held_m5 >= 10 && r_mult < 1.0)
       {
@@ -487,7 +593,9 @@ public:
       }
 
       // 5. Stage 3: +1.5R ATR Trailing Stop (Ratcheting)
-      if(m_pos.engine != ENGINE_C_MEAN_REVERSION && r_mult >= 1.5)
+      double trail_start = (m_pos.mode >= 1) ? m_sc_trail_start_r : 1.5;
+      double trail_mult  = (m_pos.mode >= 1) ? m_sc_trail_atr : 1.2;
+      if(m_pos.engine != ENGINE_C_MEAN_REVERSION && r_mult >= trail_start)
       {
          m_pos.stage = STAGE_3_ATR_TRAIL;
          double atr_m5 = regime.atr_m5;
@@ -495,7 +603,7 @@ public:
          {
             if(m_pos.direction == DIR_LONG)
             {
-               double ratcheted_sl = current_bid - 1.2 * atr_m5;
+               double ratcheted_sl = current_bid - trail_mult * atr_m5;
                if(ratcheted_sl > (m_pos.current_sl + point * 10))
                {
                   if(m_trade.PositionModify(m_pos.ticket, ratcheted_sl, 0.0))
@@ -508,7 +616,7 @@ public:
             }
             else
             {
-               double ratcheted_sl = current_ask + 1.2 * atr_m5;
+               double ratcheted_sl = current_ask + trail_mult * atr_m5;
                if(ratcheted_sl < (m_pos.current_sl - point * 10))
                {
                   if(m_trade.PositionModify(m_pos.ticket, ratcheted_sl, 0.0))

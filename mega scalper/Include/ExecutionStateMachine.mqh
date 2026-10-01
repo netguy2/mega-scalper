@@ -243,7 +243,8 @@ public:
                                           regime.atr_m5,
                                           lots,
                                           is_indivisible,
-                                          size_log))
+                                          size_log,
+                                          m_pending_signal.risk_mult))
          {
             if(m_logger != NULL)
                m_logger.LogEvent("SIZING_FAIL", size_log);
@@ -325,7 +326,9 @@ public:
                                                m_trade.ResultPrice(),
                                                m_pending_signal.sl_price,
                                                lots,
-                                               is_indivisible);
+                                               is_indivisible,
+                                               (m_pending_signal.sub_type == "SWEEP") ? 2 :
+                                               ((m_pending_signal.sub_type == "M1SCALP") ? 1 : 0));
                m_state = STATE_MANAGED;
             }
             else

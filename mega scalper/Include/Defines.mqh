@@ -186,55 +186,101 @@ struct SDrySignal
    string               primary_rejection_reason;
 };
 
-//--- Scalp Engine live state (M15 bias -> M5 location -> M1 trigger).
-//    Drives the panel checklist so "SCANNING" always has a concrete reason.
+//--- Scalp layer configuration (filled from EA inputs)
+struct SScalpConfig
+{
+   bool     enabled;
+   bool     sweep_enabled;
+   bool     use_h1_bias;
+   // trend-pullback mode
+   int      lookback_bars;
+   int      swing_bars;
+   double   zone_atr;
+   double   hold_atr;
+   double   max_ext_atr;
+   double   min_body_frac;
+   double   sl_buffer_atr;
+   double   min_sl_atr;
+   double   atr_sl_mult;
+   // context filters
+   double   min_room_atr;
+   double   rsi_max;
+   double   min_atr_usd;
+   int      min_grade_pts;
+   // liquidity-sweep mode
+   double   sweep_min_depth;
+   double   sweep_max_depth;
+   double   sweep_close_pos;
+   double   sweep_disp_mult;
+   double   round_step;
+   // session windows (broker server hours)
+   int      asian_start;
+   int      asian_end;
+   int      london_start;
+   int      overlap_start;
+   int      overlap_end;
+   int      ny_end;
+};
+
+//--- Scalp Engine live state. Mode-agnostic: the engine fills six generic checklist
+//    rows (3 "location" + 3 "trigger") so the panel never needs to know the mode.
 struct SScalpState
 {
-   ENUM_TRADE_DIRECTION direction;      // M15-regime bias (LONG / SHORT / NONE)
-   bool     regime_ok;                  // active regime is TREND_UP / TREND_DN
+   ENUM_TRADE_DIRECTION direction;      // trade direction under evaluation
+   int      mode;                       // 0 none, 1 trend pullback, 2 liquidity sweep
+   string   mode_name;
+   bool     regime_ok;                  // regime is tradable by the scalp layer
 
-   // M5 location (all values in ATR_M5 units, signed so that "positive = with the trade")
-   bool     loc_touch;                  // recent M1 pullback reached the M5 EMA9 zone
-   double   loc_touch_val;
-   double   loc_touch_lim;
-   bool     loc_hold;                   // price still holding above/below M5 EMA21 band
-   double   loc_hold_val;
-   double   loc_hold_lim;
-   bool     loc_noext;                  // price not over-extended from M5 EMA9 (no chasing)
-   double   loc_noext_val;
-   double   loc_noext_lim;
+   string   loc_title;
+   string   trg_title;
+   string   rule;                       // human description of the trigger rule
+   string   ck_label[6];
+   string   ck_value[6];
+   bool     ck_pass[6];
+   int      loc_n;                      // satisfied location rows (0-3)
+   int      trg_n;                      // satisfied trigger units (0-2)
    bool     location_ok;
-
-   // M1 micro trigger
-   bool     trg_structure;              // closed beyond the micro swing high/low
-   double   trg_struct_val;
-   bool     trg_reclaim;                // reclaimed M5 EMA9 after dipping through it
-   bool     trg_momentum;               // decisive body vs average M1 range
-   double   trg_mom_val;
-   double   trg_mom_lim;
    bool     trigger_ok;
 
-   bool     entry_ready;                // location_ok && trigger_ok
+   // Context filters
+   int      h1_bias;                    // +1 up, -1 down, 0 neutral
+   bool     ctx_bias_ok;
+   double   room_atr;                   // free space to the next key level, in ATR(M5)
+   string   room_level;
+   bool     ctx_room_ok;
+   double   rsi_m1;
+   bool     ctx_rsi_ok;
+   double   atr_usd;
+   bool     ctx_vol_ok;
+   int      session_id;                 // 0 off, 1 asia, 2 london, 3 overlap, 4 ny
+   string   session_name;
+   bool     ctx_ok;
+   string   ctx_reason;
+
+   // Confluence grade (drives position size)
+   int      grade_pts;
+   string   grade;
+   double   risk_mult;
+
+   bool     entry_ready;
    double   sl_price;
    datetime eval_time;
    string   reason;                     // first missing ingredient, human readable
 
    void Reset(void)
    {
-      direction     = DIR_NONE;
-      regime_ok     = false;
-      loc_touch     = false; loc_touch_val = 0.0; loc_touch_lim = 0.0;
-      loc_hold      = false; loc_hold_val  = 0.0; loc_hold_lim  = 0.0;
-      loc_noext     = false; loc_noext_val = 0.0; loc_noext_lim = 0.0;
-      location_ok   = false;
-      trg_structure = false; trg_struct_val = 0.0;
-      trg_reclaim   = false;
-      trg_momentum  = false; trg_mom_val = 0.0; trg_mom_lim = 0.0;
-      trigger_ok    = false;
-      entry_ready   = false;
-      sl_price      = 0.0;
-      eval_time     = 0;
-      reason        = "";
+      direction = DIR_NONE; mode = 0; mode_name = "-"; regime_ok = false;
+      loc_title = "LOCATION"; trg_title = "TRIGGER"; rule = "";
+      for(int i = 0; i < 6; i++) { ck_label[i] = "-"; ck_value[i] = "--"; ck_pass[i] = false; }
+      loc_n = 0; trg_n = 0; location_ok = false; trigger_ok = false;
+      h1_bias = 0; ctx_bias_ok = false;
+      room_atr = 0.0; room_level = ""; ctx_room_ok = false;
+      rsi_m1 = 50.0; ctx_rsi_ok = false;
+      atr_usd = 0.0; ctx_vol_ok = false;
+      session_id = 0; session_name = "OFF";
+      ctx_ok = false; ctx_reason = "";
+      grade_pts = 0; grade = "-"; risk_mult = 1.0;
+      entry_ready = false; sl_price = 0.0; eval_time = 0; reason = "";
    }
 };
 
@@ -251,17 +297,21 @@ struct SFunnel
    int exec_blocked;     // G7 + dispatch refusals
    int in_trade;         // bars skipped because a position was already open
    int gates_passed;     // all gates OK
-   int regime_ok;        // ...and regime is TREND_UP / TREND_DN
-   int location_ok;      // ...and M5 location valid
-   int trigger_ok;       // ...and M1 trigger valid
-   int dispatched;       // ...entries actually sent to the execution state machine
+   int regime_ok;        // ...and regime tradable by the scalp layer
+   int location_ok;      // ...and location / liquidity level valid
+   int trigger_ok;       // ...and trigger / sweep confirmation valid
+   int ctx_blocked;      // trigger valid but a context filter (bias / room / RSI / vol / grade) refused
+   int cooldown_blocked; // post-loss cooldown or daily entry cap
+   int dispatched;       // entries actually sent to the execution state machine
+   int sweep_entries;    // ...of which liquidity-sweep entries
 
    void Reset(void)
    {
       scanned = 0; warmup_blocked = 0; session_blocked = 0; spread_blocked = 0;
       news_blocked = 0; regime_blocked = 0; risk_blocked = 0; exec_blocked = 0;
       in_trade = 0; gates_passed = 0; regime_ok = 0; location_ok = 0;
-      trigger_ok = 0; dispatched = 0;
+      trigger_ok = 0; ctx_blocked = 0; cooldown_blocked = 0; dispatched = 0;
+      sweep_entries = 0;
    }
 };
 
@@ -298,6 +348,7 @@ struct SSignalResult
    string               fail_details;
    datetime             signal_time;
    int                  score;
+   double               risk_mult;     // confluence-grade position size multiplier (1.0 = full risk)
 };
 
 //--- Position Lifecycle Tracking
@@ -318,6 +369,7 @@ struct SPositionTrack
    int                  bars_held_m5;
    bool                 indivisible;
    bool                 active;
+   int                  mode;          // 0 = legacy M5 engines, 1 = trend-pullback scalp, 2 = liquidity sweep
 };
 
 //--- Per-Engine Attribution Metrics

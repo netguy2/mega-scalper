@@ -61,7 +61,8 @@ public:
                               double atr_m5,
                               double &lots,
                               bool &is_indivisible,
-                              string &log_details)
+                              string &log_details,
+                              double risk_mult = 1.0)
    {
       double equity = AccountInfoDouble(ACCOUNT_EQUITY);
       if(equity <= 0.0)
@@ -74,6 +75,10 @@ public:
       double risk_pct = m_risk_per_trade_pct;
       if(engine == ENGINE_C_MEAN_REVERSION)
          risk_pct *= 0.75;
+
+      // Confluence grade scales risk down for weaker setups (never above 1.5x)
+      double rm = (risk_mult > 0.0) ? MathMin(risk_mult, 1.5) : 1.0;
+      risk_pct *= rm;
 
       double risk_amount = equity * risk_pct;
 

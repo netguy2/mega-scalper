@@ -100,16 +100,50 @@ input int      InpNewsBlackoutMin         = 30;     // 38. news_blackout_min
 //+------------------------------------------------------------------+
 //| SCALP ENGINE: M15 bias -> M5 location -> M1 micro-trigger        |
 //+------------------------------------------------------------------+
-input group "=== SCALP ENGINE (M1 TRIGGER LAYER) ==="
-input bool     InpScalpEnabled            = true;   // Enable M1 scalp triggers (trades inside TREND_UP / TREND_DN)
-input int      InpScalpLookbackM1         = 8;      // M1 bars scanned for the pullback extreme
-input int      InpScalpSwingBarsM1        = 4;      // M1 bars defining the micro swing high/low
-input double   InpScalpZoneATR            = 0.30;   // Pullback must reach M5 EMA9 + zone*ATR(M5)
-input double   InpScalpHoldATR            = 0.50;   // Max break of M5 EMA21 tolerated (ATR) before trend is "lost"
-input double   InpScalpMaxExtATR          = 1.20;   // Do not chase beyond M5 EMA9 + this*ATR(M5)
-input double   InpScalpMinBodyFrac        = 0.60;   // Trigger candle body >= frac * avg M1 range
-input double   InpScalpSLBufferATR        = 0.10;   // Stop buffer beyond micro swing (ATR M5)
+input group "=== SCALP ENGINE: ENTRY (M1 TRIGGER LAYER) ==="
+input bool     InpScalpEnabled            = true;   // Enable the M1 scalp layer (both modes below)
+input int      InpScalpLookbackM1         = 8;      // [Trend] M1 bars scanned for the pullback extreme
+input int      InpScalpSwingBarsM1        = 4;      // [Trend] M1 bars defining the micro swing high/low
+input double   InpScalpZoneATR            = 0.30;   // [Trend] Pullback must reach M5 EMA9 + zone*ATR(M5)
+input double   InpScalpHoldATR            = 0.50;   // [Trend] Max break of M5 EMA21 tolerated (ATR) before trend is "lost"
+input double   InpScalpMaxExtATR          = 1.20;   // [Trend] Do not chase beyond M5 EMA9 + this*ATR(M5)
+input double   InpScalpMinBodyFrac        = 0.60;   // [Trend] Trigger candle body >= frac * avg M1 range
+input double   InpScalpSLBufferATR        = 0.10;   // Stop buffer beyond the micro swing / sweep wick (ATR M5)
 input double   InpScalpMinSLATR           = 0.60;   // Minimum stop distance (ATR M5)
+
+input group "=== SCALP ENGINE: LIQUIDITY SWEEP MODE ==="
+input bool     InpSweepEnabled            = true;   // Trade stop-hunt reversals at key levels (also active in RANGE)
+input double   InpSweepMinDepthATR        = 0.05;   // Wick must take the level out by at least this (ATR M5)
+input double   InpSweepMaxDepthATR        = 1.00;   // ...but not by more than this (that is a breakdown, not a sweep)
+input double   InpSweepClosePos           = 0.60;   // Rejection: close in the favourable 40% of the M1 bar
+input double   InpSweepDispMult           = 1.20;   // Displacement: bar range >= mult * average M1 range
+input double   InpRoundStep               = 50.0;   // Round-number level spacing ($)
+
+input group "=== SCALP ENGINE: CONTEXT FILTERS ==="
+input bool     InpUseH1Bias               = true;   // Block trades against the H1 EMA50/EMA200 bias
+input double   InpScalpMinRoomATR         = 0.80;   // Require this much free space (ATR M5) to the next key level
+input double   InpScalpRSIMax             = 78.0;   // No buys above / sells below (100-x) RSI(M1): exhaustion
+input double   InpScalpMinATRUsd          = 0.80;   // Dead-market floor: ATR(M5) in $ must exceed this
+input int      InpScalpMinGradePts        = 0;      // Minimum confluence points (0=any, 2=B+, 3=A only)
+input int      InpScalpLossCooldownMin    = 3;      // After a loss wait N min x consecutive losses (max x3), 0=off
+input int      InpMaxEntriesPerDay        = 30;     // Hard cap on scalp entries per server day, 0=off
+
+input group "=== SESSIONS (BROKER SERVER HOURS - adjust to your broker's GMT offset) ==="
+input int      InpAsianStartHour          = 0;      // Asian range start
+input int      InpAsianEndHour            = 7;      // Asian range end / London open
+input int      InpLondonStartHour         = 7;      // London session start
+input int      InpOverlapStartHour        = 12;     // London + New York overlap start
+input int      InpOverlapEndHour          = 16;     // Overlap end
+input int      InpNYEndHour               = 20;     // New York session end
+
+input group "=== SCALP ENGINE: EXIT MANAGEMENT ==="
+input int      InpScalpTimeStopMin        = 15;     // Close scalps that have not worked after N minutes (0=off)
+input double   InpScalpTimeStopR          = 0.20;   // ...unless they are at least this many R in profit
+input double   InpScalpTPR                = 2.20;   // Bank the remainder at this R multiple (0=off)
+input double   InpScalpTrailStartR        = 1.20;   // ATR trail starts at this R (scalps)
+input double   InpScalpTrailATR           = 0.70;   // Trail distance in ATR(M5) (scalps)
+input bool     InpScalpAdverseExit        = true;   // Exit early on a decisive opposite M1 impulse before break-even
+input int      InpFlattenMinOfDay         = 1320;   // Flatten scalps at this server minute-of-day (1320=22:00; Friday -60), 0=off
 
 //--- Operational Settings
 input group "=== OPERATIONAL CONSTANTS ==="
@@ -305,7 +339,29 @@ void RunScalpPipeline(double spread_pts, double point)
    if(!g_scalp.trigger_ok)   return;
    g_funnel.trigger_ok++;
 
-   if(!sig.valid)            return;
+   if(!sig.valid)
+   {
+      // Setup is complete but a context filter (H1 bias / room / RSI / ATR floor) or the grade refused it
+      g_funnel.ctx_blocked++;
+      return;
+   }
+
+   // Post-loss cooldown (scaled by consecutive losses) and daily entry cap
+   int streak = g_gates.GetConsecLosses();
+   if(InpScalpLossCooldownMin > 0 && streak > 0 && g_gates.GetLastCloseTime() > 0)
+   {
+      long wait_sec = (long)InpScalpLossCooldownMin * 60 * (long)MathMin(streak, 3);
+      if((long)(TimeCurrent() - g_gates.GetLastCloseTime()) < wait_sec)
+      {
+         g_funnel.cooldown_blocked++;
+         return;
+      }
+   }
+   if(InpMaxEntriesPerDay > 0 && g_funnel.dispatched >= InpMaxEntriesPerDay)
+   {
+      g_funnel.cooldown_blocked++;
+      return;
+   }
 
    // Do not stack on a signal the M5-close path already queued this tick
    if(g_exec_sm.GetState() == STATE_PRE_TRADE_CHECK)
@@ -314,6 +370,7 @@ void RunScalpPipeline(double spread_pts, double point)
    if(g_exec_sm.DispatchSignal(sig))
    {
       g_funnel.dispatched++;
+      if(sig.sub_type == "SWEEP") g_funnel.sweep_entries++;
       g_last_signal = sig;
       if(InpEnableDecisionLog)
       {
@@ -414,18 +471,40 @@ int OnInit()
                    InpRejectionWickRatioMR,
                    InpMaxFadeExtensionATR);
 
-   // 7b. Initialize Scalp Engine (M1 trigger layer)
-   g_scalp_engine.Init(symbol,
-                       InpScalpEnabled,
-                       InpScalpLookbackM1,
-                       InpScalpSwingBarsM1,
-                       InpScalpZoneATR,
-                       InpScalpHoldATR,
-                       InpScalpMaxExtATR,
-                       InpScalpMinBodyFrac,
-                       InpScalpSLBufferATR,
-                       InpScalpMinSLATR,
-                       InpATRSLMult);
+   // 7b. Initialize Scalp Engine (M1 trigger layer + market context)
+   SScalpConfig scfg;
+   scfg.enabled         = InpScalpEnabled;
+   scfg.sweep_enabled   = InpSweepEnabled;
+   scfg.use_h1_bias     = InpUseH1Bias;
+   scfg.lookback_bars   = InpScalpLookbackM1;
+   scfg.swing_bars      = InpScalpSwingBarsM1;
+   scfg.zone_atr        = InpScalpZoneATR;
+   scfg.hold_atr        = InpScalpHoldATR;
+   scfg.max_ext_atr     = InpScalpMaxExtATR;
+   scfg.min_body_frac   = InpScalpMinBodyFrac;
+   scfg.sl_buffer_atr   = InpScalpSLBufferATR;
+   scfg.min_sl_atr      = InpScalpMinSLATR;
+   scfg.atr_sl_mult     = InpATRSLMult;
+   scfg.min_room_atr    = InpScalpMinRoomATR;
+   scfg.rsi_max         = InpScalpRSIMax;
+   scfg.min_atr_usd     = InpScalpMinATRUsd;
+   scfg.min_grade_pts   = InpScalpMinGradePts;
+   scfg.sweep_min_depth = InpSweepMinDepthATR;
+   scfg.sweep_max_depth = InpSweepMaxDepthATR;
+   scfg.sweep_close_pos = InpSweepClosePos;
+   scfg.sweep_disp_mult = InpSweepDispMult;
+   scfg.round_step      = InpRoundStep;
+   scfg.asian_start     = InpAsianStartHour;
+   scfg.asian_end       = InpAsianEndHour;
+   scfg.london_start    = InpLondonStartHour;
+   scfg.overlap_start   = InpOverlapStartHour;
+   scfg.overlap_end     = InpOverlapEndHour;
+   scfg.ny_end          = InpNYEndHour;
+   if(!g_scalp_engine.Init(symbol, scfg))
+   {
+      Print("[INIT FATAL] Scalp market-context indicators failed to initialize!");
+      return INIT_FAILED;
+   }
    g_scalp.Reset();
    g_funnel.Reset();
 
@@ -445,6 +524,13 @@ int OnInit()
                         InpSpreadChaosAbsPts,
                         InpDailyDDPct,
                         InpContinuousResearchMode);
+   g_trade_manager.ConfigureScalpExits(InpScalpTimeStopMin,
+                                       InpScalpTimeStopR,
+                                       InpScalpTPR,
+                                       InpScalpTrailStartR,
+                                       InpScalpTrailATR,
+                                       InpFlattenMinOfDay,
+                                       InpScalpAdverseExit);
 
    // 10. Initialize Execution State Machine
    g_exec_sm.Init(symbol,
@@ -505,6 +591,7 @@ void OnDeinit(const int reason)
    g_dec_logger.Close();
    g_logger.Close();
    g_data.ReleaseIndicators();
+   g_scalp_engine.Release();
 }
 
 //+------------------------------------------------------------------+
@@ -605,6 +692,8 @@ void OnTick()
       signal.fail_code        = "";
       signal.fail_details     = "";
       signal.signal_time      = TimeCurrent();
+      signal.score            = 0;
+      signal.risk_mult        = 1.0;
 
       string final_decision  = "NO_TRADE";
       string detailed_reason = "";
@@ -707,6 +796,7 @@ void OnTick()
    if(current_m1_bar_time != g_last_m1_bar_time)
    {
       g_last_m1_bar_time = current_m1_bar_time;
+      g_trade_manager.OnM1BarClose();        // adverse-impulse exit for unprotected scalps
       RunScalpPipeline(spread_pts, point);
 
       if(InpEnableOnChartPanel)

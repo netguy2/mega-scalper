@@ -402,26 +402,32 @@ private:
       }
       else if(!sc.regime_ok)
       {
-         title  = "STANDBY - NO TREND BIAS";
+         title  = "STANDBY - NO SETUP REGIME";
          reason = (sc.reason != "") ? sc.reason : StringFormat("Regime is %s", RegimeToString(m_last_regime.active_regime));
          accent = COL_SUB; tint = COL_CARD;
       }
       else if(!sc.location_ok)
       {
-         title  = "WAITING FOR PULLBACK";
+         title  = (sc.mode == 2) ? "HUNTING A LIQUIDITY SWEEP" : "WAITING FOR PULLBACK";
          reason = sc.reason;
          accent = COL_AMB; tint = TINT_AMB;
       }
       else if(!sc.trigger_ok)
       {
-         title  = "ARMED - WAITING FOR M1 TRIGGER";
+         title  = (sc.mode == 2) ? "SWEEP SEEN - AWAITING CONFIRMATION" : "ARMED - WAITING FOR M1 TRIGGER";
+         reason = sc.reason;
+         accent = COL_AMB; tint = TINT_AMB;
+      }
+      else if(!sc.entry_ready)
+      {
+         title  = "SETUP FOUND - FILTERED OUT";
          reason = sc.reason;
          accent = COL_AMB; tint = TINT_AMB;
       }
       else
       {
-         title  = "TRIGGER READY";
-         reason = "All scalp conditions met - entry fires on the next tick.";
+         title  = StringFormat("TRIGGER READY - GRADE %s", sc.grade);
+         reason = StringFormat("%s %s. Entry fires on the next tick at %.2fx risk.", sc.mode_name, DirectionToString(sc.direction), sc.risk_mult);
          accent = COL_GRN; tint = TINT_GRN;
       }
    }
@@ -510,27 +516,28 @@ private:
       string labels[4];
       string vals[4];
       int    stg[4];
-      labels[0] = "REGIME";  labels[1] = "M5 LOCATION";  labels[2] = "M1 TRIGGER";  labels[3] = "EXECUTION";
+      labels[0] = "REGIME";
+      labels[1] = sc.regime_ok ? sc.loc_title : "LOCATION";
+      labels[2] = sc.regime_ok ? sc.trg_title : "TRIGGER";
+      labels[3] = "EXECUTION";
 
-      // 1. Regime
+      // 1. Regime (tradable = trend, or range while sweeps are enabled)
       vals[0] = RegimeShort(rg.active_regime);
       stg[0]  = sc.regime_ok ? ST_PASS : ((rg.active_regime == REGIME_CHAOS) ? ST_BLOCK : ST_WAIT);
 
-      // 2. M5 location
+      // 2. Location / liquidity level
       if(!sc.regime_ok) { vals[1] = "--"; stg[1] = ST_IDLE; }
       else
       {
-         int n = (sc.loc_touch ? 1 : 0) + (sc.loc_hold ? 1 : 0) + (sc.loc_noext ? 1 : 0);
-         vals[1] = StringFormat("%d / 3", n);
+         vals[1] = StringFormat("%d / 3", sc.loc_n);
          stg[1]  = sc.location_ok ? ST_PASS : ST_WAIT;
       }
 
-      // 3. M1 trigger (grey until the location is valid, but the count is still shown)
+      // 3. Trigger / confirmation (grey until the location is valid, but the count is still shown)
       if(!sc.regime_ok) { vals[2] = "--"; stg[2] = ST_IDLE; }
       else
       {
-         int n2 = (sc.trg_momentum ? 1 : 0) + ((sc.trg_structure || sc.trg_reclaim) ? 1 : 0);
-         vals[2] = StringFormat("%d / 2", n2);
+         vals[2] = StringFormat("%d / 2", sc.trg_n);
          stg[2]  = sc.trigger_ok ? (sc.location_ok ? ST_PASS : ST_IDLE) : (sc.location_ok ? ST_WAIT : ST_IDLE);
       }
 
@@ -576,20 +583,21 @@ private:
       const SScalpState sc = m_last_scalp;
       bool act = sc.regime_ok;
 
-      PutText("CK_H0", "M5 LOCATION", x0, cy, COL_MUTE, 7, true);
-      PutText("CK_H1", "M1 TRIGGER",  x1, cy, COL_MUTE, 7, true);
+      PutText("CK_H0", sc.loc_title, x0, cy, COL_MUTE, 7, true);
+      PutText("CK_H1", sc.trg_title, x1, cy, COL_MUTE, 7, true);
+      PutText("CK_MODE", sc.regime_ok ? sc.mode_name : "", m_x + 14 + iw, cy, COL_CYAN, 7, true, 1);
       PutRect("CK_DIV", m_x + 14 + colw + 5, cy, 1, 14 + 3 * 18, COL_LINE, COL_LINE);
       int ry = cy + 15;
 
-      CheckRow("T", "Pullback zone", StringFormat("%.2f / %.2f", sc.loc_touch_val, sc.loc_touch_lim), sc.loc_touch,  act, x0, ry,      colw);
-      CheckRow("H", "Trend held",    StringFormat("%+.2f / %+.2f", sc.loc_hold_val, sc.loc_hold_lim),  sc.loc_hold,   act, x0, ry + 18, colw);
-      CheckRow("E", "Not extended",  StringFormat("%.2f / %.2f", sc.loc_noext_val, sc.loc_noext_lim),  sc.loc_noext,  act, x0, ry + 36, colw);
+      string keys[6] = {"A", "B", "C", "D", "E", "F"};
+      for(int i = 0; i < 6; i++)
+      {
+         int col_x = (i < 3) ? x0 : x1;
+         int row_y = ry + (i % 3) * 18;
+         CheckRow(keys[i], sc.ck_label[i], sc.ck_value[i], sc.ck_pass[i], act, col_x, row_y, colw);
+      }
 
-      CheckRow("S", "Structure break", StringFormat("%+.2f ATR", sc.trg_struct_val),                  sc.trg_structure, act, x1, ry,      colw);
-      CheckRow("R", "EMA9 reclaim",    sc.trg_reclaim ? "YES" : "NO",                                  sc.trg_reclaim,   act, x1, ry + 18, colw);
-      CheckRow("M", "Momentum",        StringFormat("%.2f / %.2f", sc.trg_mom_val, sc.trg_mom_lim),    sc.trg_momentum,  act, x1, ry + 36, colw);
-
-      PutText("CK_NOTE", "Trigger = Momentum AND (Structure OR Reclaim).  Values in ATR(M5).", m_x + 14, ry + 56, COL_MUTE, 7);
+      PutText("CK_NOTE", Clip(sc.rule, 84), m_x + 14, ry + 56, COL_MUTE, 7);
       return ry + 56 + 18;
    }
 
@@ -601,23 +609,43 @@ private:
       PutText("GT_V_" + key, value, x + 13, y + 12, (st == ST_IDLE) ? COL_MUTE : COL_TXT, 8);
    }
 
-   int RenderGatesStrip(int cy)
+   int RenderContextGrid(int cy)
    {
       int iw = m_width - 28;
-      int cw = iw / 4;
+      int cw = iw / 5;
       const SGateResults g = m_last_gates;
+      const SScalpState sc = m_last_scalp;
       bool in_trade = HasPosition();
+      bool have_dir = (sc.regime_ok && sc.direction != DIR_NONE);
 
-      PutText("GS_H", "ENTRY GATES", m_x + 14, cy, COL_MUTE, 7, true);
-      int y = cy + 15;
-      int x = m_x + 14;
+      PutText("GS_H", "CONTEXT & GATES", m_x + 14, cy, COL_MUTE, 7, true);
+      PutText("GS_HR", have_dir ? StringFormat("grade %s  x%.2f risk", sc.grade, sc.risk_mult) : "", m_x + 14 + iw, cy, COL_SUB, 7, false, 1);
+      int y1 = cy + 15;
+      int y2 = y1 + 30;
+      int x  = m_x + 14;
 
-      GateChip("S", "SESSION", g.g2_session ? "OPEN" : "CLOSED", g.g2_session ? ST_PASS : ST_BLOCK, x, y);
-      GateChip("P", "SPREAD",  StringFormat("%.2f / %.2f", g.spread_atr_ratio, g.spread_limit_ratio), g.g3_spread ? ST_PASS : ST_BLOCK, x + cw, y);
-      GateChip("N", "NEWS",    g.g4_news ? "CLEAR" : "BLACKOUT", g.g4_news ? ST_PASS : ST_BLOCK, x + 2 * cw, y);
-      GateChip("R", "RISK",    StringFormat("%d / %d pos", g.open_positions, g.max_positions),
-               in_trade ? ST_LIVE : (g.g6_risk ? ST_PASS : ST_BLOCK), x + 3 * cw, y);
-      return y + 32;
+      // ---- Row 1: market context --------------------------------------
+      string bias = (sc.h1_bias > 0) ? "UP" : ((sc.h1_bias < 0) ? "DOWN" : "NEUTRAL");
+      int bias_st = !have_dir ? ST_IDLE : (!sc.ctx_bias_ok ? ST_BLOCK : (((int)sc.direction == sc.h1_bias) ? ST_PASS : ST_WAIT));
+      GateChip("B", "H1 BIAS", bias, bias_st, x, y1);
+
+      string room = (sc.room_atr >= 50.0) ? "clear" : StringFormat("%.1f %s", sc.room_atr, Clip(sc.room_level, 7));
+      GateChip("R", "ROOM", room, !have_dir ? ST_IDLE : (sc.ctx_room_ok ? ST_PASS : ST_BLOCK), x + cw, y1);
+
+      GateChip("I", "RSI M1", StringFormat("%.0f", sc.rsi_m1), !have_dir ? ST_IDLE : (sc.ctx_rsi_ok ? ST_PASS : ST_BLOCK), x + 2 * cw, y1);
+      GateChip("V", "ATR M5", StringFormat("$%.2f", sc.atr_usd), sc.ctx_vol_ok ? ST_PASS : (sc.atr_usd > 0.0 ? ST_BLOCK : ST_IDLE), x + 3 * cw, y1);
+
+      int grade_st = !have_dir ? ST_IDLE : ((sc.grade_pts >= 3) ? ST_PASS : ((sc.grade_pts == 2) ? ST_WAIT : ST_IDLE));
+      GateChip("G", "GRADE", have_dir ? StringFormat("%s (%d pts)", sc.grade, sc.grade_pts) : "--", grade_st, x + 4 * cw, y1);
+
+      // ---- Row 2: execution gates ----------------------------------------
+      GateChip("S", "SESSION", g.g2_session ? sc.session_name : "CLOSED", g.g2_session ? ((sc.session_id == 3 || sc.session_id == 2) ? ST_PASS : ST_WAIT) : ST_BLOCK, x, y2);
+      GateChip("P", "SPREAD",  StringFormat("%.2f/%.2f", g.spread_atr_ratio, g.spread_limit_ratio), g.g3_spread ? ST_PASS : ST_BLOCK, x + cw, y2);
+      GateChip("N", "NEWS",    g.g4_news ? "CLEAR" : "BLACKOUT", g.g4_news ? ST_PASS : ST_BLOCK, x + 2 * cw, y2);
+      GateChip("K", "RISK",    StringFormat("%d/%d pos", g.open_positions, g.max_positions),
+               in_trade ? ST_LIVE : (g.g6_risk ? ST_PASS : ST_BLOCK), x + 3 * cw, y2);
+      GateChip("M", "MODE",    sc.regime_ok ? ((sc.mode == 2) ? "SWEEP" : "TREND") : "--", sc.regime_ok ? ST_LIVE : ST_IDLE, x + 4 * cw, y2);
+      return y2 + 34;
    }
 
    int RenderFunnel(int cy)
@@ -628,14 +656,16 @@ private:
       PutText("FN_H", "TODAY'S FUNNEL", m_x + 14, cy, COL_MUTE, 7, true);
       PutText("FN_HR", "closed M1 bars, server day", m_x + 14 + iw, cy, COL_MUTE, 7, false, 1);
 
-      string names[6];
-      int    cnt[6];
-      names[0] = "M1 bars scanned";  cnt[0] = f.scanned;
-      names[1] = "Passed all gates"; cnt[1] = f.gates_passed;
-      names[2] = "Trending regime";  cnt[2] = f.regime_ok;
-      names[3] = "M5 location OK";   cnt[3] = f.location_ok;
-      names[4] = "M1 trigger OK";    cnt[4] = f.trigger_ok;
-      names[5] = "Entries sent";     cnt[5] = f.dispatched;
+      string names[7];
+      int    cnt[7];
+      int passed_filters = MathMax(0, f.trigger_ok - f.ctx_blocked - f.cooldown_blocked);
+      names[0] = "M1 bars scanned";   cnt[0] = f.scanned;
+      names[1] = "Passed all gates";  cnt[1] = f.gates_passed;
+      names[2] = "Regime tradable";   cnt[2] = f.regime_ok;
+      names[3] = "Location / level";  cnt[3] = f.location_ok;
+      names[4] = "Trigger / sweep";   cnt[4] = f.trigger_ok;
+      names[5] = "Passed filters";    cnt[5] = passed_filters;
+      names[6] = "Entries sent";      cnt[6] = f.dispatched;
 
       int base    = MathMax(1, f.scanned);
       int lab_w   = 112;
@@ -643,14 +673,14 @@ private:
       int track_w = iw - lab_w - 44;
       int y = cy + 16;
 
-      for(int i = 0; i < 6; i++)
+      for(int i = 0; i < 7; i++)
       {
-         color fill = (i == 5) ? COL_GRN : COL_CYAN_D;
+         color fill = (i == 6) ? COL_GRN : COL_CYAN_D;
          int fw = (cnt[i] > 0) ? (int)MathMax(2.0, MathRound((double)track_w * (double)cnt[i] / (double)base)) : 1;
-         PutText(StringFormat("FN_L%d", i), names[i], m_x + 14, y, (i == 5) ? COL_TXT : COL_SUB, 8);
+         PutText(StringFormat("FN_L%d", i), names[i], m_x + 14, y, (i == 6) ? COL_TXT : COL_SUB, 8);
          PutRect(StringFormat("FN_T%d", i), track_x, y + 5, track_w, 6, COL_CARD2, COL_CARD2);
          PutRect(StringFormat("FN_F%d", i), track_x, y + 5, fw, 6, (cnt[i] > 0) ? fill : COL_CARD2, (cnt[i] > 0) ? fill : COL_CARD2);
-         PutText(StringFormat("FN_C%d", i), IntegerToString(cnt[i]), m_x + 14 + iw, y, (i == 5 && cnt[i] > 0) ? COL_GRN : COL_TXT, 8, true, 1);
+         PutText(StringFormat("FN_C%d", i), IntegerToString(cnt[i]), m_x + 14 + iw, y, (i == 6 && cnt[i] > 0) ? COL_GRN : COL_TXT, 8, true, 1);
          y += 16;
       }
 
@@ -664,11 +694,14 @@ private:
       if(f.risk_blocked > 0)    parts += StringFormat("Risk %d  ", f.risk_blocked);
       if(f.exec_blocked > 0)    parts += StringFormat("Exec %d  ", f.exec_blocked);
       if(f.warmup_blocked > 0)  parts += StringFormat("Warmup %d  ", f.warmup_blocked);
-      if(no_trend > 0)          parts += StringFormat("No-trend %d  ", no_trend);
+      if(no_trend > 0)          parts += StringFormat("No-setup-regime %d  ", no_trend);
+      if(f.ctx_blocked > 0)     parts += StringFormat("Filters %d  ", f.ctx_blocked);
+      if(f.cooldown_blocked > 0) parts += StringFormat("Cooldown/cap %d  ", f.cooldown_blocked);
       if(f.in_trade > 0)        parts += StringFormat("In-trade %d  ", f.in_trade);
       if(parts == "") parts = (f.scanned == 0) ? "Waiting for the first closed M1 bar" : "No blocks recorded";
 
       string l1, l2;
+      if(f.sweep_entries > 0) parts += StringFormat("| sweep entries %d", f.sweep_entries);
       WrapTwo("Dropped at: " + parts, 78, l1, l2);
       PutText("FN_X1", l1, m_x + 14, y + 2, COL_MUTE, 7);
       PutText("FN_X2", l2, m_x + 14, y + 14, COL_MUTE, 7);
@@ -701,7 +734,8 @@ private:
          else if(pos.stage == STAGE_2_PARTIAL_CLOSE) stage = "PARTIAL";
          else if(pos.stage == STAGE_3_ATR_TRAIL) stage = "ATR TRAIL";
 
-         PutText("PS_A", StringFormat("%s  %.2f lots", DirectionToString(pos.direction), pos.current_lots), m_x + 26, cy + 8, dc, 9, true);
+         string mtag = (pos.mode == 2) ? "SWEEP" : ((pos.mode == 1) ? "TREND" : "M5");
+         PutText("PS_A", StringFormat("%s  %.2f lots  [%s]", DirectionToString(pos.direction), pos.current_lots, mtag), m_x + 26, cy + 8, dc, 9, true);
          PutText("PS_B", StringFormat("%s  (%+.0f pts)", Money(pnl), pts), m_x + 14 + iw - 12, cy + 8, pc, 9, true, 1);
          PutText("PS_C", StringFormat("Entry %.2f   SL %.2f   Stage: %s", pos.entry_price, pos.current_sl, stage), m_x + 26, cy + 29, COL_SUB, 8);
          PutText("PS_D", "", m_x + 14 + iw - 12, cy + 29, COL_SUB, 8, false, 1);
@@ -752,7 +786,7 @@ private:
       cy = RenderPipeline(cy);
       if(m_collapsed) return cy;
       cy = RenderChecklists(cy);
-      cy = RenderGatesStrip(cy);
+      cy = RenderContextGrid(cy);
       cy = RenderFunnel(cy);
       cy = RenderPositionStrip(cy);
       return cy;

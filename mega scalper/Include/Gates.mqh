@@ -72,6 +72,9 @@ public:
       ResetDailyTracking();
    }
 
+   int      GetConsecLosses(void) const { return m_daily_consec_losses; }
+   datetime GetLastCloseTime(void) const { return m_last_trade_close_time; }
+
    void SetResearchMode(bool active) { m_research_mode = active; }
    bool IsResearchMode(void) const { return m_research_mode; }
 
